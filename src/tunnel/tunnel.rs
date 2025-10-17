@@ -1,0 +1,425 @@
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use anyhow::Result;
+use tokio::sync::{Mutex, RwLock, watch};
+use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use reqwest::Client;
+use log::{info, debug, error};
+use prost::Message;
+use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
+use tokio_tungstenite::{WebSocketStream, MaybeTlsStream};
+use tokio::net::TcpStream;
+use url::Url;
+use dashmap::DashMap;
+use std::error::Error;
+use crate::tunnel::{bootstrap::BootstrapMgr, tcp_proxy::TcpProxy, udp_proxy::UdpProxy};
+use tokio::net::UdpSocket;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+const KEEPALIVE_INTERVAL: u64 = 10;
+const WAIT_PONG_TIMEOUT: i32 = 3;
+
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/pb.rs"));
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Pop {
+    #[serde(rename = "server_url")]
+    pub url: String,
+    #[serde(rename = "access_token")]
+    pub token: String,
+}
+
+pub struct TunnelOptions {
+    pub uuid: String,
+    pub udp_timeout: u64,
+    pub tcp_timeout: u64,
+    pub bootstrap_mgr: Option<Arc<BootstrapMgr>>,
+    pub direct_url: String,
+    pub version: String,
+}
+
+pub struct Tunnel {
+    uuid: String,
+    ws_writer: Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>>,
+    ws_reader: Arc<Mutex<Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>>,
+    write_lock: Mutex<()>,
+    bootstrap_mgr: Option<Arc<BootstrapMgr>>,
+    direct_url: String,
+    waitpone: Arc<RwLock<i32>>,
+    proxy_sessions: DashMap<String, Arc<TcpProxy>>,
+    proxy_udps: DashMap<String, Arc<UdpProxy>>,
+    is_destroy: Arc<RwLock<bool>>,
+    udp_timeout: u64,
+    tcp_timeout: u64,
+    cancel_keepalive: watch::Sender<bool>,
+    version: String,
+    http_client: Client,
+}
+
+impl Tunnel {
+    pub async fn new(opts: TunnelOptions) -> Result<Arc<Self>> {
+        let (tx, _rx) = watch::channel(false);
+        let t = Tunnel {
+            uuid: opts.uuid,
+            ws_writer: Arc::new(Mutex::new(None)),
+            ws_reader: Arc::new(Mutex::new(None)),
+            write_lock: Mutex::new(()),
+            bootstrap_mgr: opts.bootstrap_mgr,
+            direct_url: opts.direct_url,
+            waitpone: Arc::new(RwLock::new(0)),
+            proxy_sessions: DashMap::new(),
+            proxy_udps: DashMap::new(),
+            is_destroy: Arc::new(RwLock::new(false)),
+            udp_timeout: opts.udp_timeout,
+            tcp_timeout: opts.tcp_timeout,
+            cancel_keepalive: tx,
+            version: opts.version,
+            http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
+        };
+        Ok(Arc::new(t))
+    }
+
+    pub async fn connect(self: &Arc<Self>) -> Result<()> {
+        let pop = self.get_pop().await?;
+        let url = format!(
+            "{}?id={}&os={}&version={}",
+            pop.url, self.uuid, std::env::consts::OS, self.version
+        );
+
+        let ws_url = Url::parse(&url)?;
+        let mut req = ws_url.clone().into_client_request()?;
+        req.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", pop.token).parse().unwrap(),
+        );
+
+        let (ws_stream, _resp) = connect_async(req)
+            .await
+            .map_err(|e| anyhow::anyhow!(format!("websocket dial err: {}", e)))?;
+
+        let (writer, reader) = ws_stream.split();
+
+        *self.ws_writer.lock().await = Some(writer);
+        *self.ws_reader.lock().await = Some(reader);
+
+        *self.waitpone.write().await = 0;
+
+        let me = Arc::clone(self);
+        tokio::spawn(async move { me.keepalive_loop().await });
+
+        info!("Tunnel.Connect, new tun {}", url);
+        Ok(())
+    }
+
+    async fn get_pop(&self) -> Result<Pop> {
+        let access_points = if !self.direct_url.is_empty() {
+            vec![self.direct_url.clone()]
+        } else {
+            if let Some(mgr) = &self.bootstrap_mgr { mgr.bootstraps() } else { vec![] }
+        };
+
+        if access_points.is_empty() {
+            return Err(anyhow::anyhow!("no access point found"));
+        }
+
+        for ap in access_points {
+            let server_url = format!("{}?nodeid={}", ap, self.uuid);
+            match self.htt_get(&server_url).await {
+                Ok(bytes) => {
+                    if let Ok(pop) = serde_json::from_slice::<Pop>(&bytes) {
+                        return Ok(pop);
+                    } else {
+                        debug!("parse pop json err");
+                    }
+                }
+                Err(e) => {
+                    debug!("htt_get err {} url: {}", e, server_url);
+                    continue;
+                }
+            }
+        }
+        Err(anyhow::anyhow!("no pop found"))
+    }
+
+    async fn htt_get(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self.http_client.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!(format!("StatusCode {}", resp.status())));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    pub async fn destroy(self: &Arc<Self>) -> Result<()> {
+        *self.is_destroy.write().await = true;
+
+        if let Some(mut ws) = self.ws_writer.lock().await.take() {
+            let _ = ws.close().await;
+        }
+
+        self.clear_proxys().await;
+        Ok(())
+    }
+
+    pub async fn is_destroyed(&self) -> bool {
+        *self.is_destroy.read().await
+    }
+
+    pub async fn serve(self: Arc<Self>) -> Result<(), Box<dyn Error + Send + Sync>> {
+        loop {
+            let mut reader_guard = self.ws_reader.lock().await; // MutexGuard 的生命周期从这里开始
+            let ws_reader = match reader_guard.as_mut() {      // 使用 reader_guard 里的引用
+                Some(r) => r,
+                None => {
+                    debug!("ws_reader is none in serve");
+                    return Ok(());
+                }
+            };
+
+            while let Some(msg_result) = ws_reader.next().await {
+                match msg_result {
+                    Ok(msg) => match msg {
+                        WsMessage::Binary(bin) => {
+                            let start = std::time::Instant::now();
+                            if let Err(e) = self.on_tunnel_msg(&bin).await {
+                                error!("on_tunnel_msg err: {:?}", e);
+                            }
+                            debug!("handle msg cost time: {}ms", start.elapsed().as_millis());
+                        }
+                        WsMessage::Ping(payload) => { let _ = self.write_pong(&payload).await; }
+                        WsMessage::Pong(_) => { *self.waitpone.write().await = 0; }
+                        other => debug!("unsupported ws message {:?}", other),
+                    },
+                    Err(e) => {
+                        error!("Error reading message: {:?}", e);
+                        break;
+                    }
+                }
+            }
+
+            self.on_close().await;
+            let _ = self.cancel_keepalive.send(true);
+            debug!("tunnel {} close", self.uuid);
+            break;
+        }
+        Ok(())
+    }
+
+    async fn on_tunnel_msg(self: &Arc<Self>, message: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        info!("on_tunnel_msg");
+        let msg = pb::Message::decode(message)?;
+        match pb::MessageType::from_i32(msg.r#type).unwrap() {
+            pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
+            pb::MessageType::ProxySessionData => self.on_proxy_session_data_from_tunnel(msg).await?,
+            pb::MessageType::ProxySessionClose => self.on_proxy_session_close(msg).await?,
+            pb::MessageType::ProxyUdpData => self.on_proxy_udp_data_from_tunnel(msg).await?,
+            _ => error!("onTunnelMsg unsupported message type {:?}", msg.r#type),
+        }
+        Ok(())
+    }
+
+    async fn on_proxy_session_create(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        info!("on_proxy_session_create");
+        // self.clone().create_proxy_session(msg).await?;
+        let tunnel_clone = self.clone();
+        tokio::spawn(async move {
+             if let Err(e) = tunnel_clone.create_proxy_session(msg.clone()).await {
+                error!("create_proxy_session: {}", e);
+            }
+            // tunnel_clone.create_proxy_session(msg.clone()).await;
+        });
+        Ok(())
+    }
+
+    async fn create_proxy_session(self: Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        info!("create_proxy_session");
+        // 如果 session 已存在，直接回复
+        if self.proxy_sessions.contains_key(&msg.session_id) {
+            return self.create_proxy_session_reply(&msg.session_id, None).await;
+        }
+
+        let dest_addr: pb::DestAddr = pb::DestAddr::decode(msg.payload.as_ref())?;
+        let conn: TcpStream = match timeout(Duration::from_secs(self.tcp_timeout), TcpStream::connect(dest_addr.addr.clone())).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
+            Err(e) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
+        };
+        info!("new tcp {}", dest_addr.addr.clone());
+        // let proxy_session = Arc::new(TcpProxy { id: msg.session_id.clone(), conn: Arc::new(Mutex::new(conn)) });
+        let proxy_session = TcpProxy::new( msg.session_id.clone(), conn).await?;
+        let proxy_session = Arc::new(proxy_session);
+        self.proxy_sessions.insert(msg.session_id.clone(), proxy_session.clone());
+
+        self.clone().create_proxy_session_reply(&msg.session_id, None).await?;
+
+        // let tunnel_clone = self.clone();
+        // tokio::spawn(async move {
+        //     proxy_session.proxy_conn(tunnel_clone).await;
+        // });
+        proxy_session.proxy_conn(self.clone()).await;
+
+        Ok(())
+    }
+
+    async fn create_proxy_session_reply(self: Arc<Self>, session_id: &str, err: Option<Box<dyn Error + Send + Sync>>) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut reply = pb::CreateSessionReply { success: err.is_none(), err_msg: err.as_ref().map_or("".to_string(), |e| e.to_string()) };
+        let mut buf = Vec::new();
+        reply.encode(&mut buf)?;
+        let msg = pb::Message { r#type: pb::MessageType::ProxySessionCreate as i32, session_id: session_id.to_string(), payload: buf };
+        let mut data = Vec::new();
+        msg.encode(&mut data)?;
+        self.write(&data).await?;
+        Ok(())
+    }
+
+    async fn on_proxy_session_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
+            proxy.write(&msg.payload).await?;
+        } else { return Err(format!("session {} not found", msg.session_id).into()); }
+        Ok(())
+    }
+
+    async fn on_proxy_session_close(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
+             proxy.close_by_server().await;
+        } else { return Err(format!("session {} not found", msg.session_id).into()); }
+        Ok(())
+    }
+
+    async fn on_proxy_udp_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let udp_data = pb::UdpData::decode(msg.payload.as_ref())?;
+        let id = msg.session_id.clone();
+
+        if let Some(proxy) = self.proxy_udps.get(&id) {
+            proxy.write(&udp_data.data).await?;
+            return Ok(());
+        }
+
+        let raddr = udp_data.addr.parse::<std::net::SocketAddr>()?;
+        let conn = UdpSocket::bind("0.0.0.0:0").await?;
+        conn.connect(raddr).await?;
+
+        let proxy_udp = Arc::new(UdpProxy { id: id.clone(), socket: Arc::new(conn), timeout_secs: self.udp_timeout });
+        proxy_udp.write(&udp_data.data).await?;
+        self.proxy_udps.insert(id.clone(), proxy_udp.clone());
+
+        let tunnel_clone = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = proxy_udp.serve(tunnel_clone).await {
+                error!("UDPProxy serve failed: {}", e);
+            }
+        });
+
+        Ok(())
+    }
+
+      // 给 proxy 调用，发送 TCP session 数据回 tunnel
+    pub async fn on_proxy_session_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("Tunnel.onProxySessionDataFromProxy session id:{}", session_id);
+        let msg = pb::Message {
+            r#type: pb::MessageType::ProxySessionData as i32,
+            session_id: session_id.to_string(),
+            payload: data.to_vec(),
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf)?;
+        self.write(&buf).await?;
+        Ok(())
+    }
+
+    // 给 proxy 调用，通知 tunnel 某个 session 关闭
+    pub async fn on_proxy_conn_close(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("Tunnel.onProxyConnClose session id:{}", session_id);
+        let msg = pb::Message {
+            r#type: pb::MessageType::ProxySessionClose as i32,
+            session_id: session_id.to_string(),
+            payload: vec![],
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf)?;
+        self.write(&buf).await?;
+        Ok(())
+    }
+
+    // 给 proxy 调用，发送 UDP 数据回 tunnel
+    pub async fn on_proxy_udp_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("Tunnel.onProxyUdpDataFromProxy session id:{}", session_id);
+        let msg = pb::Message {
+            r#type: pb::MessageType::ProxyUdpData as i32,
+            session_id: session_id.to_string(),
+            payload: data.to_vec(),
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf)?;
+        self.write(&buf).await?;
+        Ok(())
+    }
+
+    async fn write(&self, data: &[u8]) -> Result<()> {
+        let _lock = self.write_lock.lock().await;
+        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
+            ws.send(WsMessage::Binary(data.to_vec())).await?;
+        } else {
+            return Err(anyhow::anyhow!("ws_writer is none"));
+        }
+        Ok(())
+    }
+
+    async fn write_ping(&self, data: &[u8]) -> Result<()> {
+        let _lock = self.write_lock.lock().await;
+        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
+            ws.send(WsMessage::Ping(data.to_vec())).await?;
+        } else {
+            return Err(anyhow::anyhow!("ws_writer is none"));
+        }
+        Ok(())
+    }
+
+    async fn write_pong(&self, data: &[u8]) -> Result<()> {
+        info!("onping");
+        let _lock = self.write_lock.lock().await;
+        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
+            ws.send(WsMessage::Pong(data.to_vec())).await?;
+        } else {
+            return Err(anyhow::anyhow!("ws_writer is none"));
+        }
+        Ok(())
+    }
+
+    async fn on_close(&self) { self.clear_proxys().await; }
+
+    async fn clear_proxys(&self) {
+        for k in self.proxy_sessions.iter().map(|e| e.key().clone()).collect::<Vec<_>>() {
+            if let Some((_, proxy)) = self.proxy_sessions.remove(&k) { proxy.destroy().await; }
+        }
+        for k in self.proxy_udps.iter().map(|e| e.key().clone()).collect::<Vec<_>>() {
+            if let Some((_, proxy)) = self.proxy_udps.remove(&k) { proxy.destroy().await; }
+        }
+    }
+
+    async fn keepalive_loop(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL));
+        loop {
+            ticker.tick().await;
+
+            if *self.is_destroy.read().await { info!("tunnel is destroy"); return; }
+
+            if let Some(mut writer_guard) = self.ws_writer.lock().await.as_mut() {
+                let mut w = self.waitpone.write().await;
+                if *w > WAIT_PONG_TIMEOUT {
+                    info!("keepalive timeout, close connect");
+                    let _ = writer_guard.close().await;
+                    return;
+                } else {
+                    *w += 1;
+                }
+            } else { return; }
+            info!("keepavlie");
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let _ = self.write_ping(&now.to_le_bytes()).await;
+        }
+    }
+}

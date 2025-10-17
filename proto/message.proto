@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "../pb";
+
+service  message{
+}
+
+// 定义消息类型枚举
+enum MessageType {
+    UNKNOWN = 0;
+    COMMAND = 1;
+    PROXY_SESSION_CREATE = 2;
+    PROXY_SESSION_DATA = 3;
+    PROXY_SESSION_CLOSE = 4;
+    PROXY_UDP_DATA = 5;
+}
+
+
+
+// 目标地址
+message DestAddr {
+    string addr = 2;
+}
+
+message UDPData {
+    string addr = 1;
+    bytes data = 2;
+}
+
+
+// 定义通用消息体
+message Message {
+    MessageType type = 1;
+    string session_id = 2;
+    bytes payload = 3;
+}
+
+message CreateSessionReply {
+    bool success = 1;
+    string err_msg = 2;
+}
