@@ -402,24 +402,51 @@ impl Tunnel {
 
     async fn keepalive_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL));
+        let mut rx = self.cancel_keepalive.subscribe(); // 订阅 channel
+
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    // 这里做 ping 检查
+                    if *self.is_destroy.read().await {
+                        info!("tunnel destroyed, exit keepalive_loop");
+                        return;
+                    }
 
-            if *self.is_destroy.read().await { info!("tunnel is destroy"); return; }
+                    let mut w = self.waitpone.write().await;
+                    if *w > WAIT_PONG_TIMEOUT {
+                        info!("keepalive timeout, close websocket");
+                        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
+                            let _ = ws.close().await;
+                        }
+                        return;
+                    } else {
+                        *w += 1;
+                    }
 
-            if let Some(mut writer_guard) = self.ws_writer.lock().await.as_mut() {
-                let mut w = self.waitpone.write().await;
-                if *w > WAIT_PONG_TIMEOUT {
-                    info!("keepalive timeout, close connect");
-                    let _ = writer_guard.close().await;
-                    return;
-                } else {
-                    *w += 1;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        .to_le_bytes();
+
+                    if let Err(e) = self.write_ping(&now).await {
+                        error!("failed to send ping: {:?}", e);
+                        return;
+                    }
+
+                    info!("keepalive ping sent");
                 }
-            } else { return; }
-            info!("keepavlie");
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let _ = self.write_ping(&now.to_le_bytes()).await;
+
+                _ = rx.changed() => {
+                    // 收到取消通知
+                    if *rx.borrow() {
+                        info!("keepalive canceled via watch channel");
+                        return;
+                    }
+                }
+            }
         }
     }
+
 }

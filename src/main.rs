@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::signal;
 use log::{info, error, LevelFilter};
 use env_logger;
+use tokio::time::{sleep, Duration};
 
 mod tunnel;
 use tunnel::{Tunnel, TunnelOptions, BootstrapMgr};
@@ -75,7 +76,8 @@ async fn main() {
     // spawn the serve loop
     let tun_clone = Arc::clone(&tun);
     tokio::spawn(async move {
-        let _ = tun_clone.serve().await;
+        // let _ = tun_clone.serve().await;
+        tun_serve(tun_clone).await
     });
 
     // wait for ctrl-c
@@ -89,4 +91,36 @@ async fn main() {
     }
 
     let _ = tun.destroy().await;
+}
+
+
+async fn tun_serve(tun: Arc<Tunnel>) {
+    loop {
+        // Serve 一次
+        let tun_clone = Arc::clone(&tun);
+        if let Err(e) = tun_clone.serve().await {
+            error!("tun serve error: {:?}", e);
+        }
+
+        // 如果已经被销毁，就退出
+        if tun.is_destroyed().await {
+            info!("Tunnel destroyed, exiting serve loop");
+            return;
+        }
+
+        // 连接失败则不断重试
+        loop {
+            let tun_clone = Arc::clone(&tun);
+            match tun_clone.connect().await {
+                Ok(_) => {
+                    info!("tun connect success");
+                    break;
+                }
+                Err(e) => {
+                    error!("tun connect failed: {:?}, retrying in 10s...", e);
+                    sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
 }
