@@ -119,7 +119,7 @@ impl Tunnel {
         let access_points = if !self.direct_url.is_empty() {
             vec![self.direct_url.clone()]
         } else {
-            if let Some(mgr) = &self.bootstrap_mgr { mgr.bootstraps() } else { vec![] }
+            if let Some(mgr) = &self.bootstrap_mgr { mgr.bootstraps().await } else { vec![] }
         };
 
         if access_points.is_empty() {

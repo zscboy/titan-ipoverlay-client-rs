@@ -1,0 +1,13 @@
+{
+	"bootstraps":[
+		"https://pcdn.titannet.io/test4/ipservice/bootstrap.json",
+		"http://8.209.251.146:8080/bootstrap.json",
+	    "http://47.85.83.7:8080/bootstrap.json"
+
+	],
+
+	"accesspoints":[
+		"http://103.129.53.178:41004/node/pop",
+		"http://59.37.137.170:41004/node/pop"
+	]
+}

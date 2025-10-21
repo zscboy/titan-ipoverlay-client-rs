@@ -20,6 +20,7 @@ dashmap = "5.4"
 clap = { version = "4", features = ["derive"] }
 url = "2"
 futures-util = "0.3"
+tracing = "0.1.41"
 
 [build-dependencies]
 prost-build = "0.13"

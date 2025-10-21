@@ -45,7 +45,7 @@ async fn main() {
     if direct_url.is_empty() {
         match BootstrapMgr::new(&app_dir).await {
             Ok(mgr) => {
-                if mgr.bootstraps().is_empty() {
+                if mgr.bootstraps().await.is_empty() {
                     error!("no bootstrap nodes found");
                     return;
                 }
