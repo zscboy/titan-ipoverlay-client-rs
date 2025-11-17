@@ -384,8 +384,16 @@ impl Tunnel {
         let mut buf = Vec::new();
         msg.encode(&mut buf)?;
         self.write(&buf).await?;
+
+        self.proxy_sessions.remove(session_id);
         Ok(())
     }
+
+    pub async fn on_proxy_udp_close(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.proxy_udps.remove(session_id);
+        Ok(())
+    }
+
 
     // 给 proxy 调用，发送 UDP 数据回 tunnel
     pub async fn on_proxy_udp_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {

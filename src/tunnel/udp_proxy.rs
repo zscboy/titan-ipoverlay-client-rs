@@ -49,13 +49,19 @@ impl UdpProxy {
                 }
                 Ok(Err(e)) => {
                     debug!("UdpProxy.serve ReadFromUDP: {:?}", e);
-                    return Ok(());
+                    break;
                 }
                 Err(_) => {
                     debug!("UdpProxy.serve timeout after {}s", self.timeout_secs);
-                    return Ok(());
+                    break;
                 }
             }
         }
+        
+        if let Err(e) = tunnel.on_proxy_udp_close(&self.id).await {
+            log::error!("on_proxy_udp_close error: {}", e);
+        }
+
+        Ok(())
     }
 }

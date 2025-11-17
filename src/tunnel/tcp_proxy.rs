@@ -57,7 +57,7 @@ impl TcpProxy {
          if let Err(e)  = tunnel.on_proxy_conn_close(&self.id).await {
             log::error!("on_proxy_conn_close error: {}", e);
          }
-        self.shutdown().await;
+        // self.shutdown().await;
     }
 
     pub async fn write(&self, data: &[u8]) -> Result<()> {
