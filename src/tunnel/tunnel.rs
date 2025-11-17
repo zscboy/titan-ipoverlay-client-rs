@@ -230,7 +230,10 @@ impl Tunnel {
                             if let Err(e) = self.on_tunnel_msg(&bin).await {
                                 error!("on_tunnel_msg err: {:?}", e);
                             }
-                            debug!("handle msg cost time: {}ms", start.elapsed().as_millis());
+
+                            if start.elapsed().as_millis() > 0 {
+                                debug!("handle msg cost time: {}ms", start.elapsed().as_millis());
+                            }
                         }
                         WsMessage::Ping(payload) => { let _ = self.write_pong(&payload).await; }
                         WsMessage::Pong(_) => { *self.waitpone.write().await = 0; }
@@ -272,7 +275,6 @@ impl Tunnel {
              if let Err(e) = tunnel_clone.create_proxy_session(msg.clone()).await {
                 error!("create_proxy_session: {}", e);
             }
-            // tunnel_clone.create_proxy_session(msg.clone()).await;
         });
         Ok(())
     }
@@ -290,7 +292,7 @@ impl Tunnel {
             Ok(Err(e)) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
             Err(e) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
         };
-        info!("new tcp {}", dest_addr.addr.clone());
+        info!("new tcp {}, id {}, total {}", dest_addr.addr.clone(), msg.session_id.clone(), self.proxy_sessions.len());
         // let proxy_session = Arc::new(TcpProxy { id: msg.session_id.clone(), conn: Arc::new(Mutex::new(conn)) });
         let proxy_session = TcpProxy::new( msg.session_id.clone(), conn).await?;
         let proxy_session = Arc::new(proxy_session);
@@ -298,10 +300,6 @@ impl Tunnel {
 
         self.clone().create_proxy_session_reply(&msg.session_id, None).await?;
 
-        // let tunnel_clone = self.clone();
-        // tokio::spawn(async move {
-        //     proxy_session.proxy_conn(tunnel_clone).await;
-        // });
         proxy_session.proxy_conn(self.clone()).await;
 
         Ok(())
@@ -348,6 +346,8 @@ impl Tunnel {
         let proxy_udp = Arc::new(UdpProxy { id: id.clone(), socket: Arc::new(conn), timeout_secs: self.udp_timeout });
         proxy_udp.write(&udp_data.data).await?;
         self.proxy_udps.insert(id.clone(), proxy_udp.clone());
+
+        debug!("Tunnel.on_proxy_udp_data_from_tunnel new udp:{}, id:{}, total udp:{}", udp_data.addr, proxy_udp.id.clone(), self.proxy_udps.len());
 
         let tunnel_clone = Arc::clone(self);
         tokio::spawn(async move {
