@@ -13,9 +13,9 @@ pub struct UdpProxy {
 }
 
 impl UdpProxy {
-    pub fn new(id: String, socket: Arc<UdpSocket>, timeout_secs: u64) -> Self {
-        Self { id, socket, timeout_secs }
-    }
+    // pub fn new(id: String, socket: Arc<UdpSocket>, timeout_secs: u64) -> Self {
+    //     Self { id, socket, timeout_secs }
+    // }
 
     pub async fn destroy(&self) {
         debug!("udp proxy destroy id={}", self.id);
@@ -43,7 +43,9 @@ impl UdpProxy {
             let dur = Duration::from_secs(self.timeout_secs);
             match timeout(dur, self.socket.recv_from(&mut buf)).await {
                 Ok(Ok((n, _from))) => {
-                    tunnel.on_proxy_udp_data_from_proxy(&self.id, &buf[..n]).await;
+                    if let Err(e) = tunnel.on_proxy_udp_data_from_proxy(&self.id, &buf[..n]).await {
+                        log::error!("on_proxy_udp_data_from_proxy error: {}", e);
+                    }
                 }
                 Ok(Err(e)) => {
                     debug!("UdpProxy.serve ReadFromUDP: {:?}", e);

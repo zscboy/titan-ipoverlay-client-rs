@@ -50,9 +50,13 @@ impl TcpProxy {
                     }
                 }
             };
-            tunnel.on_proxy_session_data_from_proxy(&self.id, &buf[..n]).await;
+            if let Err(e) = tunnel.on_proxy_session_data_from_proxy(&self.id, &buf[..n]).await {
+                log::error!("on_proxy_session_data_from_proxy error: {}", e);
+            }
         }
-        tunnel.on_proxy_conn_close(&self.id).await;
+         if let Err(e)  = tunnel.on_proxy_conn_close(&self.id).await {
+            log::error!("on_proxy_conn_close error: {}", e);
+         }
         self.shutdown().await;
     }
 

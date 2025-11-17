@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.21"
-tungstenite = { version = "0.21", features = ["__rustls-tls"] }
-reqwest = { version = "0.12", features = ["json","gzip","brotli","rustls-tls"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls"] }
+tungstenite = { version = "0.21", default-features = false, features = ["__rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json","gzip","brotli","rustls-tls"] }
 prost = "0.13"
 prost-derive = "0.13"
 bytes = "1.4"
@@ -24,3 +24,6 @@ tracing = "0.1.41"
 
 [build-dependencies]
 prost-build = "0.13"
+
+[features]
+default = []

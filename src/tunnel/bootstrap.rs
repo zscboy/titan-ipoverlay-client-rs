@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::RwLock, time::sleep};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -24,7 +24,7 @@ pub struct BootstrapMgr {
 
 impl BootstrapMgr {
     pub async fn new(dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        let dir = dir.into();
+        let dir: PathBuf = dir.into();
         tokio_fs::create_dir_all(&dir).await?;
 
         let bootstrap_path = dir.join(BOOTSTRAP_FILE);
@@ -103,8 +103,8 @@ impl BootstrapMgr {
     }
 
     async fn http_get(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        let resp = self.client.get(url).send().await?;
-        let status = resp.status();
+        let resp: reqwest::Response = self.client.get(url).send().await?;
+        let status: reqwest::StatusCode = resp.status();
         let bytes = resp.bytes().await?;
 
         if !status.is_success() {

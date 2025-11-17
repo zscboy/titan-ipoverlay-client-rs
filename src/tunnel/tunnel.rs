@@ -119,16 +119,17 @@ impl Tunnel {
         let access_points = if !self.direct_url.is_empty() {
             vec![self.direct_url.clone()]
         } else {
-            if let Some(mgr) = &self.bootstrap_mgr { mgr.bootstraps().await } else { vec![] }
+            self.get_accesspoint().await
         };
 
         if access_points.is_empty() {
             return Err(anyhow::anyhow!("no access point found"));
         }
 
+        //  debug!("access_points {}", string::fr);
         for ap in access_points {
             let server_url = format!("{}?nodeid={}", ap, self.uuid);
-            match self.htt_get(&server_url).await {
+            match self.http_get(&server_url).await {
                 Ok(bytes) => {
                     if let Ok(pop) = serde_json::from_slice::<Pop>(&bytes) {
                         return Ok(pop);
@@ -145,7 +146,49 @@ impl Tunnel {
         Err(anyhow::anyhow!("no pop found"))
     }
 
-    async fn htt_get(&self, url: &str) -> Result<Vec<u8>> {
+    pub async fn get_accesspoint(&self) -> Vec<String> {
+        // bootstrap URLs
+        // let bootstrap_urls = self.bootstrap_mgr.bootstraps().await;
+        //  if let Some(mgr) = &self.bootstrap_mgr { mgr.bootstraps().await } else { vec![] }
+        let bootstrap_urls = if let Some(mgr) = &self.bootstrap_mgr {
+            mgr.bootstraps().await
+        } else {
+            Vec::new()
+        };
+
+        for bootstrap_url in bootstrap_urls {
+            // HTTP GET
+            let bytes = match self.http_get(&bootstrap_url).await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Tunnel.get_access_point http_get error: {}, url: {}", e, bootstrap_url);
+                    continue;
+                }
+            };
+
+            // JSON struct
+            #[derive(serde::Deserialize)]
+            struct Config {
+                #[serde(rename = "accesspoints")]
+                access_points: Vec<String>,
+            }
+
+            // Parse JSON
+            let cfg: Config = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Tunnel.get_access_point unmarshal error: {}", e);
+                    continue;
+                }
+            };
+
+            return cfg.access_points;
+        }
+
+        Vec::new()
+    }
+
+    async fn http_get(&self, url: &str) -> Result<Vec<u8>> {
         let resp = self.http_client.get(url).send().await?;
         if !resp.status().is_success() {
             return Err(anyhow::anyhow!(format!("StatusCode {}", resp.status())));
@@ -211,7 +254,7 @@ impl Tunnel {
     async fn on_tunnel_msg(self: &Arc<Self>, message: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("on_tunnel_msg");
         let msg = pb::Message::decode(message)?;
-        match pb::MessageType::from_i32(msg.r#type).unwrap() {
+        match pb::MessageType::try_from(msg.r#type).unwrap() {
             pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
             pb::MessageType::ProxySessionData => self.on_proxy_session_data_from_tunnel(msg).await?,
             pb::MessageType::ProxySessionClose => self.on_proxy_session_close(msg).await?,
@@ -265,7 +308,7 @@ impl Tunnel {
     }
 
     async fn create_proxy_session_reply(self: Arc<Self>, session_id: &str, err: Option<Box<dyn Error + Send + Sync>>) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut reply = pb::CreateSessionReply { success: err.is_none(), err_msg: err.as_ref().map_or("".to_string(), |e| e.to_string()) };
+        let reply = pb::CreateSessionReply { success: err.is_none(), err_msg: err.as_ref().map_or("".to_string(), |e| e.to_string()) };
         let mut buf = Vec::new();
         reply.encode(&mut buf)?;
         let msg = pb::Message { r#type: pb::MessageType::ProxySessionCreate as i32, session_id: session_id.to_string(), payload: buf };
@@ -379,7 +422,7 @@ impl Tunnel {
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
-        info!("onping");
+        // info!("onping");
         let _lock = self.write_lock.lock().await;
         if let Some(ws) = self.ws_writer.lock().await.as_mut() {
             ws.send(WsMessage::Pong(data.to_vec())).await?;
@@ -435,7 +478,7 @@ impl Tunnel {
                         return;
                     }
 
-                    info!("keepalive ping sent");
+                    // info!("keepalive ping sent");
                 }
 
                 _ = rx.changed() => {
