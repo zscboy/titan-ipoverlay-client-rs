@@ -535,8 +535,10 @@ impl Tunnel {
 
                 for id in to_remove {
                     if let Some(proxy) = tunnel.proxy_udps.get(&id) {
-                        let _ = proxy.destroy();
+                        let _ = proxy.destroy().await;
                     }
+
+                    
                 }
             }
         });
