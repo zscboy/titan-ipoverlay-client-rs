@@ -63,7 +63,7 @@ pub struct Tunnel {
 impl Tunnel {
     pub async fn new(opts: TunnelOptions) -> Result<Arc<Self>> {
         let (tx, _rx) = watch::channel(false);
-        let t = Tunnel {
+        let t = Arc::new(Self {
             uuid: opts.uuid,
             ws_writer: Arc::new(Mutex::new(None)),
             ws_reader: Arc::new(Mutex::new(None)),
@@ -79,8 +79,10 @@ impl Tunnel {
             cancel_keepalive: tx,
             version: opts.version,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
-        };
-        Ok(Arc::new(t))
+        });
+
+        Tunnel::start_udp_idle_watchdog(&t).await;
+        Ok(t)
     }
 
     pub async fn connect(self: &Arc<Self>) -> Result<()> {
@@ -339,11 +341,19 @@ impl Tunnel {
             return Ok(());
         }
 
-        let raddr = udp_data.addr.parse::<std::net::SocketAddr>()?;
+        let raddr = match udp_data.addr.parse::<std::net::SocketAddr>() {
+            Ok(a) => a,
+            Err(_) => {
+                log::error!("Invalid UDP addr: {}", udp_data.addr);
+                return Err(anyhow::anyhow!("invalid udp addr").into());
+            }
+        };
+
         let conn = UdpSocket::bind("0.0.0.0:0").await?;
         conn.connect(raddr).await?;
 
-        let proxy_udp = Arc::new(UdpProxy { id: id.clone(), socket: Arc::new(conn), timeout_secs: self.udp_timeout });
+        // UdpProxy { id: id.clone(), socket: Arc::new(conn), timeout_secs: self.udp_timeout }
+        let proxy_udp = Arc::new(UdpProxy::new(id.clone(), Arc::new(conn), self.udp_timeout ));
         proxy_udp.write(&udp_data.data).await?;
         self.proxy_udps.insert(id.clone(), proxy_udp.clone());
 
@@ -498,6 +508,33 @@ impl Tunnel {
                 }
             }
         }
+    }
+
+    pub async fn start_udp_idle_watchdog(this: &Arc<Self>) {
+        let tunnel = Arc::clone(this);
+
+        tokio::spawn(async move {
+            loop {
+                if tunnel.is_destroyed().await {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_secs(tunnel.udp_timeout / 2)).await;
+
+                let ids: Vec<String> = tunnel
+                    .proxy_udps
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+
+                for id in ids {
+                    if let Some(proxy) = tunnel.proxy_udps.get(&id) {
+                        let proxy_clone = proxy.clone();
+                        proxy_clone.close_udp_if_timeout().await;
+                    }
+                }
+            }
+        });
     }
 
 }
