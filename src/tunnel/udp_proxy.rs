@@ -47,17 +47,13 @@ impl UdpProxy {
     }
 
     // Idle timeout watchdog: close socket if no read/write occurs
-    pub async fn close_udp_if_timeout(self: Arc<Self>) {
+    pub async fn check_idle_timeout(&self) -> bool {
         let t = self.last_active.lock().await;
         if t.elapsed().as_secs() >= self.timeout_secs {
-            debug!(
-                "UdpProxy idle timeout id={} after {} secs",
-                self.id, self.timeout_secs
-            );
-
-            // Close socket
-            self.closed_notify.notify_waiters();
+            debug!("udp proxy {} idle timeout", self.id);
+            return true;
         }
+        false
     }
 
     pub async fn serve(self: Arc<Self>, tunnel: Arc<Tunnel>) -> Result<()> {

@@ -16,7 +16,7 @@ async fn main() {
         .arg(Arg::new("app-dir").long("app-dir").default_value("").help("--app-dir='./'"))
         .arg(Arg::new("direct-url").long("direct-url").default_value("").help("--direct-url=http://localhost:41005/node/pop"))
         .arg(Arg::new("uuid").long("uuid").required(true).help("--uuid ..."))
-        .arg(Arg::new("udp-timeout").long("udp-timeout").default_value("60").help("--udp-timeout 60"))
+        .arg(Arg::new("udp-timeout").long("udp-timeout").default_value("30").help("--udp-timeout 30"))
         .arg(Arg::new("tcp-timeout").long("tcp-timeout").default_value("3").help("--tcp-timeout 3"))
         .arg(Arg::new("debug").long("debug").action(clap::ArgAction::SetTrue).help("--debug"))
         .get_matches();

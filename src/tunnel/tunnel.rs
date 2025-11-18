@@ -257,7 +257,7 @@ impl Tunnel {
     }
 
     async fn on_tunnel_msg(self: &Arc<Self>, message: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        info!("on_tunnel_msg");
+        debug!("on_tunnel_msg");
         let msg = pb::Message::decode(message)?;
         match pb::MessageType::try_from(msg.r#type).unwrap() {
             pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
@@ -270,7 +270,7 @@ impl Tunnel {
     }
 
     async fn on_proxy_session_create(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        info!("on_proxy_session_create");
+        debug!("on_proxy_session_create");
         // self.clone().create_proxy_session(msg).await?;
         let tunnel_clone = self.clone();
         tokio::spawn(async move {
@@ -282,7 +282,7 @@ impl Tunnel {
     }
 
     async fn create_proxy_session(self: Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        info!("create_proxy_session");
+        debug!("create_proxy_session");
         // 如果 session 已存在，直接回复
         if self.proxy_sessions.contains_key(&msg.session_id) {
             return self.create_proxy_session_reply(&msg.session_id, None).await;
@@ -319,6 +319,7 @@ impl Tunnel {
     }
 
     async fn on_proxy_session_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("on_proxy_session_data_from_tunnel");
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
             proxy.write(&msg.payload).await?;
         } else { return Err(format!("session {} not found", msg.session_id).into()); }
@@ -326,6 +327,7 @@ impl Tunnel {
     }
 
     async fn on_proxy_session_close(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("on_proxy_session_close");
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
              proxy.close_by_server().await;
         } else { return Err(format!("session {} not found", msg.session_id).into()); }
@@ -333,6 +335,7 @@ impl Tunnel {
     }
 
     async fn on_proxy_udp_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("on_proxy_udp_data_from_tunnel");
         let udp_data = pb::UdpData::decode(msg.payload.as_ref())?;
         let id = msg.session_id.clone();
 
@@ -344,7 +347,7 @@ impl Tunnel {
         let raddr = match udp_data.addr.parse::<std::net::SocketAddr>() {
             Ok(a) => a,
             Err(_) => {
-                log::error!("Invalid UDP addr: {}", udp_data.addr);
+                error!("Invalid UDP addr: {}", udp_data.addr);
                 return Err(anyhow::anyhow!("invalid udp addr").into());
             }
         };
@@ -514,23 +517,25 @@ impl Tunnel {
         let tunnel = Arc::clone(this);
 
         tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(tunnel.udp_timeout/2));
             loop {
-                if tunnel.is_destroyed().await {
+                ticker.tick().await;
+
+                if *tunnel.is_destroy.read().await {
                     break;
                 }
 
-                tokio::time::sleep(Duration::from_secs(tunnel.udp_timeout / 2)).await;
+                let mut to_remove = Vec::new();
+                for entry in tunnel.proxy_udps.iter() {
+                    let proxy = entry.value();
+                    if proxy.check_idle_timeout().await {
+                        to_remove.push(entry.key().clone());
+                    }
+                }
 
-                let ids: Vec<String> = tunnel
-                    .proxy_udps
-                    .iter()
-                    .map(|e| e.key().clone())
-                    .collect();
-
-                for id in ids {
+                for id in to_remove {
                     if let Some(proxy) = tunnel.proxy_udps.get(&id) {
-                        let proxy_clone = proxy.clone();
-                        proxy_clone.close_udp_if_timeout().await;
+                        let _ = proxy.destroy();
                     }
                 }
             }
