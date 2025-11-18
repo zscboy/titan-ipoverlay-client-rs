@@ -31,7 +31,7 @@ impl UdpProxy {
     }
 
     pub async fn destroy(&self) {
-        debug!("udp proxy {} destroy called", self.id);
+        // debug!("udp proxy {} destroy called", self.id);
         self.closed_notify.notify_waiters();
     }
 
@@ -79,7 +79,7 @@ impl UdpProxy {
                 }
 
                 _ = self.closed_notify.notified() => {
-                    debug!("udp proxy {} closing via manual destroy", self.id);
+                    // debug!("udp proxy {} closing via manual destroy", self.id);
                     break;
                 }
             }

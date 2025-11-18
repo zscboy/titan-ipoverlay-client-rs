@@ -346,8 +346,8 @@ impl Tunnel {
 
         let raddr = match udp_data.addr.parse::<std::net::SocketAddr>() {
             Ok(a) => a,
-            Err(_) => {
-                error!("Invalid UDP addr: {}", udp_data.addr);
+            Err(e) => {
+                error!("Invalid UDP addr: {}, err:{}", udp_data.addr, e);
                 return Err(anyhow::anyhow!("invalid udp addr").into());
             }
         };
@@ -443,7 +443,7 @@ impl Tunnel {
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
-        // info!("onping");
+        info!("onping");
         let _lock = self.write_lock.lock().await;
         if let Some(ws) = self.ws_writer.lock().await.as_mut() {
             ws.send(WsMessage::Pong(data.to_vec())).await?;
@@ -499,7 +499,7 @@ impl Tunnel {
                         return;
                     }
 
-                    // info!("keepalive ping sent");
+                    info!("keepalive send ping");
                 }
 
                 _ = rx.changed() => {
