@@ -346,11 +346,24 @@ impl Tunnel {
             return Ok(());
         }
 
-        let raddr = match udp_data.addr.parse::<std::net::SocketAddr>() {
+        let raddr: std::net::SocketAddr = match udp_data.addr.parse() {
             Ok(a) => a,
-            Err(e) => {
-                error!("Invalid UDP addr: {}, err:{}", udp_data.addr, e);
-                return Err(anyhow::anyhow!("invalid udp addr").into());
+            Err(_) => {
+                match tokio::net::lookup_host(&udp_data.addr).await {
+                    Ok(mut addrs) => {
+                        match addrs.next() {
+                            Some(a) => a,
+                            None => {
+                                error!("DNS lookup returned no result for {}", udp_data.addr);
+                                return Err(anyhow::anyhow!("invalid udp addr").into());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to resolve domain {}: {}", udp_data.addr, e);
+                        return Err(anyhow::anyhow!("invalid udp addr").into());
+                    }
+                }
             }
         };
 
