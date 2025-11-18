@@ -233,9 +233,9 @@ impl Tunnel {
                                 error!("on_tunnel_msg err: {:?}", e);
                             }
 
-                            if start.elapsed().as_millis() > 0 {
+                            // if start.elapsed().as_millis() > 0 {
                                 debug!("handle msg cost time: {}ms", start.elapsed().as_millis());
-                            }
+                            // }
                         }
                         WsMessage::Ping(payload) => { let _ = self.write_pong(&payload).await; }
                         WsMessage::Pong(_) => { *self.waitpone.write().await = 0; }
@@ -340,7 +340,9 @@ impl Tunnel {
         let id = msg.session_id.clone();
 
         if let Some(proxy) = self.proxy_udps.get(&id) {
+            debug!("on_proxy_udp_data_from_tunnel, to be write date to {}", id);
             proxy.write(&udp_data.data).await?;
+            debug!("on_proxy_udp_data_from_tunnel, write date to {} complete", id);
             return Ok(());
         }
 
