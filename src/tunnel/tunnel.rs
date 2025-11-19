@@ -19,7 +19,8 @@ use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const KEEPALIVE_INTERVAL: u64 = 10;
-const WAIT_PONG_TIMEOUT: i32 = 3;
+const MAX_PONG_MISS: i32 = 3;
+const WS_WRITE_TIMEOUT: u64 = 3;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/pb.rs"));
@@ -46,7 +47,7 @@ pub struct Tunnel {
     uuid: String,
     ws_writer: Arc<Mutex<Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>>,
     ws_reader: Arc<Mutex<Option<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>>,
-    write_lock: Mutex<()>,
+    // write_lock: Mutex<()>,
     bootstrap_mgr: Option<Arc<BootstrapMgr>>,
     direct_url: String,
     waitpone: Arc<RwLock<i32>>,
@@ -67,7 +68,7 @@ impl Tunnel {
             uuid: opts.uuid,
             ws_writer: Arc::new(Mutex::new(None)),
             ws_reader: Arc::new(Mutex::new(None)),
-            write_lock: Mutex::new(()),
+            // write_lock: Mutex::new(()),
             bootstrap_mgr: opts.bootstrap_mgr,
             direct_url: opts.direct_url,
             waitpone: Arc::new(RwLock::new(0)),
@@ -258,7 +259,7 @@ impl Tunnel {
 
     async fn on_tunnel_msg(self: &Arc<Self>, message: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
         debug!("on_tunnel_msg");
-        let msg = pb::Message::decode(message)?;
+        let msg: pb::Message = pb::Message::decode(message)?;
         match pb::MessageType::try_from(msg.r#type).unwrap() {
             pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
             pb::MessageType::ProxySessionData => self.on_proxy_session_data_from_tunnel(msg).await?,
@@ -367,7 +368,7 @@ impl Tunnel {
             }
         };
 
-        let conn = UdpSocket::bind("0.0.0.0:0").await?;
+        let conn: UdpSocket = UdpSocket::bind("0.0.0.0:0").await?;
         conn.connect(raddr).await?;
 
         // UdpProxy { id: id.clone(), socket: Arc::new(conn), timeout_secs: self.udp_timeout }
@@ -438,34 +439,67 @@ impl Tunnel {
     }
 
     async fn write(&self, data: &[u8]) -> Result<()> {
-        let _lock = self.write_lock.lock().await;
-        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
-            ws.send(WsMessage::Binary(data.to_vec())).await?;
-        } else {
-            return Err(anyhow::anyhow!("ws_writer is none"));
+        let mut guard = self.ws_writer.lock().await;
+        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
+
+        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
+            ws.send(WsMessage::Binary(data.to_vec()))
+        ).await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                error!("ws write failed: {}", e);
+                Err(anyhow::anyhow!(e))
+            }
+            Err(_) => {
+                error!("ws write timeout");
+                Err(anyhow::anyhow!("ws send timeout"))
+            }
         }
-        Ok(())
     }
 
     async fn write_ping(&self, data: &[u8]) -> Result<()> {
-        let _lock = self.write_lock.lock().await;
-        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
-            ws.send(WsMessage::Ping(data.to_vec())).await?;
-        } else {
-            return Err(anyhow::anyhow!("ws_writer is none"));
+        let mut guard = self.ws_writer.lock().await;
+        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
+
+        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
+             ws.send(WsMessage::Ping(data.to_vec()))
+        ).await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                error!("write_ping failed: {}", e);
+                Err(anyhow::anyhow!(e))
+            }
+            Err(_) => {
+                error!("write_ping timeout");
+                Err(anyhow::anyhow!("write_ping timeout"))
+            }
         }
-        Ok(())
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
         info!("onping");
-        let _lock = self.write_lock.lock().await;
-        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
-            ws.send(WsMessage::Pong(data.to_vec())).await?;
-        } else {
-            return Err(anyhow::anyhow!("ws_writer is none"));
+        let mut guard = self.ws_writer.lock().await;
+        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
+
+        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
+             ws.send(WsMessage::Pong(data.to_vec()))
+        ).await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                error!("write_pong failed: {}", e);
+                Err(anyhow::anyhow!(e))
+            }
+            Err(_) => {
+                error!("write_pong timeout");
+                Err(anyhow::anyhow!("write_pong timeout"))
+            }
         }
-        Ok(())
     }
 
     async fn on_close(&self) { self.clear_proxys().await; }
@@ -493,7 +527,7 @@ impl Tunnel {
                     }
 
                     let mut w = self.waitpone.write().await;
-                    if *w > WAIT_PONG_TIMEOUT {
+                    if *w > MAX_PONG_MISS {
                         info!("keepalive timeout, close websocket");
                         if let Some(ws) = self.ws_writer.lock().await.as_mut() {
                             let _ = ws.close().await;

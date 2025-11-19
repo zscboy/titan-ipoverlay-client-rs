@@ -5,8 +5,12 @@ use tokio::sync::Mutex;
 use anyhow::Result;
 use log::{debug, error};
 use tokio::sync::{Notify};
+use tokio::time::{timeout, Duration};
 
 use crate::tunnel::tunnel::Tunnel;
+
+
+const UDP_WRITE_TIMEOUT: u64 = 3;
 
 #[derive(Clone)]
 pub struct UdpProxy {
@@ -42,8 +46,22 @@ impl UdpProxy {
             *t = Instant::now();
         }
 
-        self.socket.send(data).await?;
-        Ok(())
+        let result = timeout(
+            Duration::from_secs(UDP_WRITE_TIMEOUT),
+            self.socket.send(data),
+        ).await;
+
+        match result {
+            Ok(Ok(_n)) => Ok(()),
+            Ok(Err(e)) => {
+                error!("udp proxy write failed: {}", e);
+                Err(anyhow::anyhow!("socket send error: {}", e))
+            }
+            Err(_) => {
+                error!("udp proxy wirte timeout");
+                Err(anyhow::anyhow!("udp proxy write timeout after {}s", UDP_WRITE_TIMEOUT))
+            }
+        }
     }
 
     // Idle timeout watchdog: close socket if no read/write occurs

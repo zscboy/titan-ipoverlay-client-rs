@@ -5,6 +5,10 @@ use tokio::sync::Mutex;
 use anyhow::Result;
 use log::{debug, error};
 use crate::tunnel::tunnel::Tunnel;
+use tokio::time::{timeout, Duration};
+
+
+const TCP_WRITE_TIMEOUT: u64 = 3;
 
 pub struct TcpProxy {
     pub id: String,
@@ -62,10 +66,20 @@ impl TcpProxy {
 
     pub async fn write(&self, data: &[u8]) -> Result<()> {
         let mut writer = self.writer.lock().await;
-        writer
-            .write_all(data)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
+
+        let result: std::result::Result<std::result::Result<(), std::io::Error>, tokio::time::error::Elapsed> = timeout(Duration::from_secs(TCP_WRITE_TIMEOUT), writer.write_all(data)).await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                error!("tcp proxy {} write failed: {}", self.id, e);
+                Err(anyhow::anyhow!(e.to_string()))
+            }
+            Err(_) => {
+                error!("tcp proxy {} write timeout", self.id);
+                Err(anyhow::anyhow!("tcp write timeout"))
+            }
+        }
     }
 
     async fn shutdown(&self) {
