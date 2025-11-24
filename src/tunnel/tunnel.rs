@@ -57,6 +57,7 @@ pub struct Tunnel {
     udp_timeout: u64,
     tcp_timeout: u64,
     cancel_keepalive: watch::Sender<bool>,
+    cancel_ws_reader: watch::Sender<bool>,
     version: String,
     http_client: Client,
 }
@@ -64,6 +65,8 @@ pub struct Tunnel {
 impl Tunnel {
     pub async fn new(opts: TunnelOptions) -> Result<Arc<Self>> {
         let (tx, _rx) = watch::channel(false);
+        let (tx_reader, _rx2) = watch::channel(false);
+
         let t = Arc::new(Self {
             uuid: opts.uuid,
             ws_writer: Arc::new(Mutex::new(None)),
@@ -78,6 +81,7 @@ impl Tunnel {
             udp_timeout: opts.udp_timeout,
             tcp_timeout: opts.tcp_timeout,
             cancel_keepalive: tx,
+            cancel_ws_reader: tx_reader,
             version: opts.version,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
         });
@@ -202,11 +206,13 @@ impl Tunnel {
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
         *self.is_destroy.write().await = true;
 
-        if let Some(mut ws) = self.ws_writer.lock().await.take() {
-            let _ = ws.close().await;
-        }
+        // if let Some(mut ws) = self.ws_writer.lock().await.take() {
+        //     let _ = ws.close().await;
+        // }
 
-        self.clear_proxys().await;
+        let _ = self.cancel_ws_reader.send(true);
+
+        // self.clear_proxys().await;
         Ok(())
     }
 
@@ -215,45 +221,61 @@ impl Tunnel {
     }
 
     pub async fn serve(self: Arc<Self>) -> Result<(), Box<dyn Error + Send + Sync>> {
-        loop {
-            let mut reader_guard = self.ws_reader.lock().await; // MutexGuard 的生命周期从这里开始
-            let ws_reader = match reader_guard.as_mut() {      // 使用 reader_guard 里的引用
-                Some(r) => r,
-                None => {
-                    debug!("ws_reader is none in serve");
-                    return Ok(());
-                }
-            };
+        let mut shutdown = self.cancel_ws_reader.subscribe();
 
-            while let Some(msg_result) = ws_reader.next().await {
-                match msg_result {
-                    Ok(msg) => match msg {
-                        WsMessage::Binary(bin) => {
-                            let start = std::time::Instant::now();
+        let mut reader_guard = self.ws_reader.lock().await;
+        let ws_reader = match reader_guard.as_mut() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        loop {
+            tokio::select! {
+                // 🔥 destroy() 发出通知后立即退出
+                _ = shutdown.changed() => {
+                    debug!("serve received shutdown");
+                    break;
+                }
+
+                ws_msg = ws_reader.next() => {
+                    match ws_msg {
+                        Some(Ok(WsMessage::Binary(bin))) => {
                             if let Err(e) = self.on_tunnel_msg(&bin).await {
                                 error!("on_tunnel_msg err: {:?}", e);
                             }
-
-                            // if start.elapsed().as_millis() > 0 {
-                                debug!("handle msg cost time: {}ms", start.elapsed().as_millis());
-                            // }
                         }
-                        WsMessage::Ping(payload) => { let _ = self.write_pong(&payload).await; }
-                        WsMessage::Pong(_) => { *self.waitpone.write().await = 0; }
-                        other => debug!("unsupported ws message {:?}", other),
-                    },
-                    Err(e) => {
-                        error!("Error reading message: {:?}", e);
-                        break;
+                        Some(Ok(WsMessage::Ping(p))) => {
+                            let _ = self.write_pong(&p).await;
+                        }
+                        Some(Ok(WsMessage::Pong(_))) => {
+                            *self.waitpone.write().await = 0;
+                        }
+                        Some(Err(e)) => {
+                            error!("ws read error: {:?}", e);
+                            break;
+                        }
+                        None => {
+                            debug!("ws reader closed");
+                            break;
+                        }
+
+                        _ => {}
                     }
                 }
             }
-
-            self.on_close().await;
-            let _ = self.cancel_keepalive.send(true);
-            debug!("tunnel {} close", self.uuid);
-            break;
         }
+
+        // ws_reader.close().await;
+
+        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
+            let _ = ws.close().await;
+        }
+
+        self.on_close().await;
+        
+        let _ = self.cancel_keepalive.send(true);
+
+        debug!("tunnel {} serve exit", self.uuid);
         Ok(())
     }
 
@@ -528,11 +550,12 @@ impl Tunnel {
 
                     let mut w = self.waitpone.write().await;
                     if *w > MAX_PONG_MISS {
-                        info!("keepalive timeout, close websocket");
-                        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
-                            let _ = ws.close().await;
-                        }
-                        return;
+                        // info!("keepalive timeout, close websocket");
+                        // if let Some(ws) = self.ws_writer.lock().await.as_mut() {
+                        //     let _ = ws.close().await;
+                        // }
+                        let _ = self.cancel_ws_reader.send(true);
+                        continue;
                     } else {
                         *w += 1;
                     }
