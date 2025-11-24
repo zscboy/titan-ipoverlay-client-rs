@@ -223,43 +223,40 @@ impl Tunnel {
     pub async fn serve(self: Arc<Self>) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut shutdown = self.cancel_ws_reader.subscribe();
 
-        let mut reader_guard = self.ws_reader.lock().await;
-        let ws_reader = match reader_guard.as_mut() {
-            Some(r) => r,
-            None => return Ok(()),
-        };
+        // 先 take 出 reader，循环直接用 owned 值
+        let ws_reader_opt = { self.ws_reader.lock().await.take() };
 
-        loop {
-            tokio::select! {
-                // 🔥 destroy() 发出通知后立即退出
-                _ = shutdown.changed() => {
-                    debug!("serve received shutdown");
-                    break;
-                }
+        if let Some(mut ws_reader) = ws_reader_opt {
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        debug!("serve received shutdown");
+                        break;
+                    }
 
-                ws_msg = ws_reader.next() => {
-                    match ws_msg {
-                        Some(Ok(WsMessage::Binary(bin))) => {
-                            if let Err(e) = self.on_tunnel_msg(&bin).await {
-                                error!("on_tunnel_msg err: {:?}", e);
+                    ws_msg = ws_reader.next() => {
+                        match ws_msg {
+                            Some(Ok(WsMessage::Binary(bin))) => {
+                                if let Err(e) = self.on_tunnel_msg(&bin).await {
+                                    error!("on_tunnel_msg err: {:?}", e);
+                                }
                             }
+                            Some(Ok(WsMessage::Ping(p))) => {
+                                let _ = self.write_pong(&p).await;
+                            }
+                            Some(Ok(WsMessage::Pong(_))) => {
+                                *self.waitpone.write().await = 0;
+                            }
+                            Some(Err(e)) => {
+                                error!("ws read error: {:?}", e);
+                                break;
+                            }
+                            None => {
+                                debug!("ws reader closed");
+                                break;
+                            }
+                            _ => {}
                         }
-                        Some(Ok(WsMessage::Ping(p))) => {
-                            let _ = self.write_pong(&p).await;
-                        }
-                        Some(Ok(WsMessage::Pong(_))) => {
-                            *self.waitpone.write().await = 0;
-                        }
-                        Some(Err(e)) => {
-                            error!("ws read error: {:?}", e);
-                            break;
-                        }
-                        None => {
-                            debug!("ws reader closed");
-                            break;
-                        }
-
-                        _ => {}
                     }
                 }
             }
@@ -267,7 +264,7 @@ impl Tunnel {
 
         // ws_reader.close().await;
 
-        if let Some(ws) = self.ws_writer.lock().await.as_mut() {
+        if let Some(mut ws) = self.ws_writer.lock().await.take() {
             let _ = ws.close().await;
         }
 
@@ -550,7 +547,7 @@ impl Tunnel {
 
                     let mut w = self.waitpone.write().await;
                     if *w > MAX_PONG_MISS {
-                        // info!("keepalive timeout, close websocket");
+                        info!("keepalive timeout, close websocket");
                         // if let Some(ws) = self.ws_writer.lock().await.as_mut() {
                         //     let _ = ws.close().await;
                         // }
