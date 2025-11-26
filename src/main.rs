@@ -4,28 +4,14 @@ use tokio::signal;
 use log::{info, error, LevelFilter};
 use env_logger;
 use tokio::time::{sleep, Duration};
-#[cfg(target_os = "android")]
-use nix::sys::prctl::set_death_signal;
-#[cfg(target_os = "android")]
-use nix::sys::signal::Signal;
+mod platform;
 
 mod tunnel;
 use tunnel::{Tunnel, TunnelOptions, BootstrapMgr};
 
 #[tokio::main]
 async fn main() {
-    #[cfg(target_os = "android")]
-    {
-        // 父进程死亡时自动 kill 自己
-        set_death_signal(Signal::SIGKILL).unwrap();
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        // 空实现，保证能编译
-        println!("set_death_signal() skipped on non-Android platform");
-    }
-
+    platform::set_parent_death_signal();
     let matches = Command::new("titan-ipoverlay-client")
         .about("vms client")
         .version(env!("CARGO_PKG_VERSION"))
