@@ -18,7 +18,7 @@ use crate::tunnel::{bootstrap::BootstrapMgr, tcp_proxy::TcpProxy, udp_proxy::Udp
 use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-const KEEPALIVE_INTERVAL: u64 = 10;
+const KEEPALIVE_INTERVAL: u64 = 20;
 const MAX_PONG_MISS: i32 = 3;
 const WS_WRITE_TIMEOUT: u64 = 3;
 

@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 url = "2"
 futures-util = "0.3"
 tracing = "0.1.41"
+nix = "0.26"
 
 [build-dependencies]
 prost-build = "0.13"
