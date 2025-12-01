@@ -500,7 +500,7 @@ impl Tunnel {
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
-        info!("onping");
+        debug!("onping");
         let mut guard = self.ws_writer.lock().await;
         let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
 
@@ -563,13 +563,12 @@ impl Tunnel {
                         .as_secs()
                         .to_le_bytes();
                     
-                    debug!("keepalive sending ping");
                     if let Err(e) = self.write_ping(&now).await {
                         error!("failed to send ping: {:?}", e);
                         return;
                     }
 
-                    info!("keepalive send ping");
+                    debug!("keepalive send ping");
                 }
 
                 _ = rx.changed() => {
