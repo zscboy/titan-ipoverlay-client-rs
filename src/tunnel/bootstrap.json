@@ -7,7 +7,6 @@
 	],
 
 	"accesspoints":[
-		"http://103.129.53.178:41004/node/pop",
-		"http://59.37.137.170:41004/node/pop"
+		"http://46.250.236.15:41004/node/pop"
 	]
 }
