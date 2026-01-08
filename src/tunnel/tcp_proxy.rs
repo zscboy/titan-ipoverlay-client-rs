@@ -10,13 +10,18 @@ use tokio::time::{timeout, Duration};
 
 const TCP_WRITE_TIMEOUT: u64 = 3;
 
+enum WriteMsg {
+    Data(Vec<u8>),
+    HalfClose,
+}
+
 pub struct TcpProxy {
     pub id: String,
 
     reader: Mutex<Option<ReadHalf<TcpStream>>>,
     raw: Mutex<Option<Arc<Mutex<TcpStream>>>>,
 
-    write_queue: mpsc::UnboundedSender<Vec<u8>>,
+    write_queue: mpsc::UnboundedSender<WriteMsg>,
 
     /// writer ready 只会 send 一次
     writer_ready_tx: Mutex<Option<oneshot::Sender<Arc<Mutex<WriteHalf<TcpStream>>>>>>,
@@ -25,7 +30,7 @@ pub struct TcpProxy {
 impl TcpProxy {
     /// 创建 TcpProxy，立即可以接收写入数据（0-RTT）
     pub fn new_with_queue(id: String) -> Arc<Self> {
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<WriteMsg>();
         let (writer_ready_tx, writer_ready_rx) = oneshot::channel();
 
         let proxy = Arc::new(Self {
@@ -44,30 +49,8 @@ impl TcpProxy {
         proxy
     }
     
-    /// 设置 TCP 连接（连接建立后调用）
-    // pub async fn set_connection(mut self, stream: TcpStream) -> Result<Self> {
-    //     // 从 tokio stream 提取同步版本
-    //     let std_stream = stream.into_std()?;
-    //     let std_stream_clone = std_stream.try_clone()?;
-    //     let raw = TcpStream::from_std(std_stream_clone)?;
-    //     let stream = TcpStream::from_std(std_stream)?;
-
-    //     let (reader, writer) = tokio::io::split(stream);
-        
-    //     self.reader = Some(Mutex::new(reader));
-    //     self.raw = Some(Arc::new(Mutex::new(raw)));
-        
-    //     // 通知写入处理器 writer 已就绪
-    //     let writer_arc = Arc::new(Mutex::new(writer));
-    //     if let Some(tx) = self.writer_ready_tx.take() {
-    //         let _ = tx.send(writer_arc);
-    //         info!("tcp proxy {} connection ready, write queue can now flush", self.id);
-    //     }
-        
-    //     Ok(self)
-    // }
      pub async fn set_connection(&self, stream: TcpStream) -> Result<()> {
-        let std_stream = stream.into_std()?;
+        let std_stream: std::net::TcpStream = stream.into_std()?;
         let std_stream_clone = std_stream.try_clone()?;
 
         let raw = TcpStream::from_std(std_stream_clone)?;
@@ -102,10 +85,10 @@ impl TcpProxy {
     }
     
     /// 写入队列处理器
-        async fn write_queue_processor(
+    async fn write_queue_processor(
         id: String,
         writer_ready_rx: oneshot::Receiver<Arc<Mutex<WriteHalf<TcpStream>>>>,
-        mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut write_rx: mpsc::UnboundedReceiver<WriteMsg>,
     ) {
         let writer = match writer_ready_rx.await {
             Ok(w) => {
@@ -118,22 +101,33 @@ impl TcpProxy {
             }
         };
 
-        while let Some(data) = write_rx.recv().await {
-            let mut guard = writer.lock().await;
-            let result = timeout(
-                Duration::from_secs(TCP_WRITE_TIMEOUT),
-                guard.write_all(&data),
-            )
-            .await;
+        while let Some(msg) = write_rx.recv().await {
+            match msg {
+                WriteMsg::Data(data) => {
+                    let mut guard = writer.lock().await;
+                    let result = timeout(
+                        Duration::from_secs(TCP_WRITE_TIMEOUT),
+                        guard.write_all(&data),
+                    )
+                    .await;
 
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    error!("tcp proxy {} write err: {}", id, e);
-                    break;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            error!("tcp proxy {} write err: {}", id, e);
+                            break;
+                        }
+                        Err(_) => {
+                            error!("tcp proxy {} write timeout", id);
+                            break;
+                        }
+                    }
                 }
-                Err(_) => {
-                    error!("tcp proxy {} write timeout", id);
+
+                WriteMsg::HalfClose => {
+                    info!("tcp proxy {} half_close (shutdown write)", id);
+                    let mut guard = writer.lock().await;
+                    let _ = guard.shutdown().await;
                     break;
                 }
             }
@@ -141,6 +135,7 @@ impl TcpProxy {
 
         debug!("tcp proxy {} write processor exit", id);
     }
+
 
     pub async fn proxy_conn(self: Arc<Self>, tunnel: Arc<Tunnel>) {
         let mut buf = [0u8; 4096];
@@ -179,10 +174,17 @@ impl TcpProxy {
         }
    }
 
+    pub async fn half_close(&self) -> Result<()> {
+        self.write_queue
+            .send(WriteMsg::HalfClose)
+            .map_err(|e| anyhow::anyhow!("half_close send failed: {}", e))?;
+
+        Ok(())
+    }
 
     pub async fn write(&self, data: &[u8]) -> Result<()> {
         self.write_queue
-            .send(data.to_vec())
+            .send(WriteMsg::Data(data.to_vec()))
             .map_err(|e| anyhow::anyhow!("write queue send failed: {}", e))?;
         Ok(())
     }

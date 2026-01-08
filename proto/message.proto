@@ -15,6 +15,7 @@ enum MessageType {
     PROXY_SESSION_DATA = 3;
     PROXY_SESSION_CLOSE = 4;
     PROXY_UDP_DATA = 5;
+    PROXY_SESSION_HALF_CLOSE = 6;
 }
 
 

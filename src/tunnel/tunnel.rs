@@ -282,6 +282,7 @@ impl Tunnel {
         match pb::MessageType::try_from(msg.r#type).unwrap() {
             pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
             pb::MessageType::ProxySessionData => self.on_proxy_session_data_from_tunnel(msg).await?,
+            pb::MessageType::ProxySessionHalfClose => self.on_proxy_session_half_close(msg).await?,
             pb::MessageType::ProxySessionClose => self.on_proxy_session_close(msg).await?,
             pb::MessageType::ProxyUdpData => self.on_proxy_udp_data_from_tunnel(msg).await?,
             _ => error!("onTunnelMsg unsupported message type {:?}", msg.r#type),
@@ -446,6 +447,14 @@ impl Tunnel {
         debug!("on_proxy_session_data_from_tunnel");
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
             proxy.write(&msg.payload).await?;
+        } else { return Err(format!("session {} not found", msg.session_id).into()); }
+        Ok(())
+    }
+
+    async fn on_proxy_session_half_close(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("on_proxy_session_half_close");
+        if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
+             proxy.half_close().await;
         } else { return Err(format!("session {} not found", msg.session_id).into()); }
         Ok(())
     }
