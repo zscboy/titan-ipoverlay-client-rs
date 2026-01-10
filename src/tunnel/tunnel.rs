@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const KEEPALIVE_INTERVAL: u64 = 20;
 const MAX_PONG_MISS: i32 = 15;
-const WS_WRITE_TIMEOUT: u64 = 15;
+const WS_WRITE_TIMEOUT: u64 = 3;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/pb.rs"));
@@ -461,10 +461,11 @@ impl Tunnel {
 
     async fn on_proxy_session_close_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
         debug!("on_proxy_session_close_from_tunnel");
-        if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
-             proxy.close_by_server().await;
-             self.proxy_sessions.remove(&msg.session_id);
-        } else { return Err(format!("session {} not found", msg.session_id).into()); }
+        if let Some((_, proxy)) = self.proxy_sessions.remove(&msg.session_id) {
+            proxy.close_by_server().await;
+        } else {
+            return Err(format!("session {} not found", msg.session_id).into());
+        }
         Ok(())
     }
 

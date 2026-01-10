@@ -20,17 +20,17 @@ pub struct TcpProxy {
     pub id: String,
 
     reader: Mutex<Option<ReadHalf<TcpStream>>>,
-    // raw: Mutex<Option<Arc<Mutex<TcpStream>>>>,
+    raw: Mutex<Option<Arc<Mutex<TcpStream>>>>,
 
     write_queue: mpsc::UnboundedSender<WriteMsg>,
 
     /// writer ready 只会 send 一次
     writer_ready_tx: Mutex<Option<oneshot::Sender<Arc<Mutex<WriteHalf<TcpStream>>>>>>,
 
-    /// 用于优雅关闭 reader
-    reader_notify: Notify,
+    // 用于优雅关闭 reader
+    // reader_notify: Notify,
 
-    is_close: Mutex<bool>,
+    // is_close: Mutex<bool>,
 }
 
 impl TcpProxy {
@@ -42,11 +42,11 @@ impl TcpProxy {
         let proxy = Arc::new(Self {
             id: id.clone(),
             reader: Mutex::new(None),
-            // raw: Mutex::new(None),
+            raw: Mutex::new(None),
             write_queue: write_tx,
             writer_ready_tx: Mutex::new(Some(writer_ready_tx)),
-            reader_notify: Notify::new(),
-            is_close: Mutex::new(false),
+            // reader_notify: Notify::new(),
+            // is_close: Mutex::new(false),
         });
 
         let proxy_id = id.clone();
@@ -58,11 +58,11 @@ impl TcpProxy {
     }
     
      pub async fn set_connection(&self, stream: TcpStream) -> Result<()> {
-        // let std_stream: std::net::TcpStream = stream.into_std()?;
-        // let std_stream_clone = std_stream.try_clone()?;
+        let std_stream: std::net::TcpStream = stream.into_std()?;
+        let std_stream_clone = std_stream.try_clone()?;
 
-        // let raw = TcpStream::from_std(std_stream_clone)?;
-        // let stream: TcpStream = TcpStream::from_std(std_stream)?;
+        let raw = TcpStream::from_std(std_stream_clone)?;
+        let stream: TcpStream = TcpStream::from_std(std_stream)?;
 
         let (reader, writer) = tokio::io::split(stream);
 
@@ -76,10 +76,10 @@ impl TcpProxy {
         }
 
         // 设置 raw
-        // {
-        //     let mut guard = self.raw.lock().await;
-        //     *guard = Some(Arc::new(Mutex::new(raw)));
-        // }
+        {
+            let mut guard = self.raw.lock().await;
+            *guard = Some(Arc::new(Mutex::new(raw)));
+        }
 
         // 通知 writer ready（只会成功一次）
         let writer_arc = Arc::new(Mutex::new(writer));
@@ -149,18 +149,8 @@ impl TcpProxy {
     let mut buf = [0u8; 4096];
 
     loop {
-        // let closed = *self.is_close.lock().await;
-        // if closed { 
-        //     error!("proxy {} already shutdown", &self.id);
-        //     return; 
-        // }
 
         let n = tokio::select! {
-            _ = self.reader_notify.notified() => {
-                info!("tcp proxy {} reader notified to shutdown", self.id);
-                return;
-            }
-
             res = async {
                 let mut guard = self.reader.lock().await;
                 let reader = guard.as_mut().ok_or_else(|| {
@@ -171,6 +161,7 @@ impl TcpProxy {
                 match res {
                     Ok(0) => {
                         debug!("tcp proxy {} eof", self.id);
+                        // TODO: 自己调用shutdown也会跑这里
                         if let Err(e) = tunnel.on_proxy_conn_half_close_from_proxy(&self.id).await
                         {
                             error!("on_proxy_conn_half_close_from_proxy err {}", e);
@@ -219,14 +210,13 @@ impl TcpProxy {
     }
 
     async fn shutdown(&self) {
-        debug!("shutdown");
-        let mut closed = self.is_close.lock().await;
-        *closed = true;
-
-        self.reader_notify.notify_waiters();
-
         if let Err(e) = self.half_close().await {
             error!("shutdown {} half_close failed: {}", self.id, e);
+        }
+
+        if let Some(raw) = self.raw.lock().await.as_ref() {
+            let mut g = raw.lock().await;
+            let _ = g.shutdown().await;
         }
     }
 
