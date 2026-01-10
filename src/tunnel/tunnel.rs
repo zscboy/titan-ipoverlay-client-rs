@@ -18,9 +18,9 @@ use crate::tunnel::{bootstrap::BootstrapMgr, tcp_proxy::TcpProxy, udp_proxy::Udp
 use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-const KEEPALIVE_INTERVAL: u64 = 2;
+const KEEPALIVE_INTERVAL: u64 = 20;
 const MAX_PONG_MISS: i32 = 15;
-const WS_WRITE_TIMEOUT: u64 = 3;
+const WS_WRITE_TIMEOUT: u64 = 15;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/pb.rs"));
@@ -282,8 +282,8 @@ impl Tunnel {
         match pb::MessageType::try_from(msg.r#type).unwrap() {
             pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
             pb::MessageType::ProxySessionData => self.on_proxy_session_data_from_tunnel(msg).await?,
-            pb::MessageType::ProxySessionHalfClose => self.on_proxy_session_half_close(msg).await?,
-            pb::MessageType::ProxySessionClose => self.on_proxy_session_close(msg).await?,
+            pb::MessageType::ProxySessionHalfClose => self.on_proxy_session_half_close_from_tunnel(msg).await?,
+            pb::MessageType::ProxySessionClose => self.on_proxy_session_close_from_tunnel(msg).await?,
             pb::MessageType::ProxyUdpData => self.on_proxy_udp_data_from_tunnel(msg).await?,
             _ => error!("onTunnelMsg unsupported message type {:?}", msg.r#type),
         }
@@ -344,7 +344,7 @@ impl Tunnel {
                             .await;
 
                         let tunnel2 = tunnel.clone();
-                        let _ = tunnel2.on_proxy_conn_close(&session_id).await;
+                        let _ = tunnel2.on_proxy_conn_close_from_proxy(&session_id).await;
                         return;
                     }
                 };
@@ -365,7 +365,7 @@ impl Tunnel {
                             .await;
 
                         let tunnel2 = tunnel.clone();
-                        let _ = tunnel2.on_proxy_conn_close(&session_id).await;
+                        let _ = tunnel2.on_proxy_conn_close_from_proxy(&session_id).await;
                         return;
                     }
                     Err(e) => {
@@ -380,7 +380,7 @@ impl Tunnel {
                             .await;
 
                         let tunnel2 = tunnel.clone();
-                        let _ = tunnel2.on_proxy_conn_close(&session_id).await;
+                        let _ = tunnel2.on_proxy_conn_close_from_proxy(&session_id).await;
                         return;
                     }
                 };
@@ -403,7 +403,7 @@ impl Tunnel {
                             .await;
 
                     let tunnel2 = tunnel.clone();
-                    let _ = tunnel2.on_proxy_conn_close(&session_id).await;
+                    let _ = tunnel2.on_proxy_conn_close_from_proxy(&session_id).await;
                     return;
                 }
 
@@ -418,7 +418,7 @@ impl Tunnel {
                         session_id, e
                     );
                     let tunnel1 = tunnel.clone();
-                    let _ = tunnel1.on_proxy_conn_close(&session_id).await;
+                    let _ = tunnel1.on_proxy_conn_close_from_proxy(&session_id).await;
                     return;
                 }
 
@@ -451,18 +451,19 @@ impl Tunnel {
         Ok(())
     }
 
-    async fn on_proxy_session_half_close(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_proxy_session_half_close");
+    async fn on_proxy_session_half_close_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("on_proxy_session_half_close_from_tunnel");
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
-             proxy.half_close().await;
+             proxy.half_close().await?;
         } else { return Err(format!("session {} not found", msg.session_id).into()); }
         Ok(())
     }
 
-    async fn on_proxy_session_close(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_proxy_session_close");
+    async fn on_proxy_session_close_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("on_proxy_session_close_from_tunnel");
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
              proxy.close_by_server().await;
+             self.proxy_sessions.remove(&msg.session_id);
         } else { return Err(format!("session {} not found", msg.session_id).into()); }
         Ok(())
     }
@@ -522,7 +523,7 @@ impl Tunnel {
 
       // 给 proxy 调用，发送 TCP session 数据回 tunnel
     pub async fn on_proxy_session_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("Tunnel.onProxySessionDataFromProxy session id:{}", session_id);
+        debug!("Tunnel.on_proxy_session_data_from_proxy session id:{} len:{}", session_id, data.len());
         let msg = pb::Message {
             r#type: pb::MessageType::ProxySessionData as i32,
             session_id: session_id.to_string(),
@@ -530,13 +531,31 @@ impl Tunnel {
         };
         let mut buf = Vec::new();
         msg.encode(&mut buf)?;
+        
+        if let Err(e) = self.write(&buf).await {
+            error!("on_proxy_session_data_from_proxy {} write: {}", session_id, e);
+        }
+
+        Ok(())
+    }
+
+    pub async fn on_proxy_conn_half_close_from_proxy(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("Tunnel.on_proxy_conn_half_close_from_proxy session id:{}", session_id);
+        let msg = pb::Message {
+            r#type: pb::MessageType::ProxySessionHalfClose as i32,
+            session_id: session_id.to_string(),
+            payload: vec![],
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf)?;
         self.write(&buf).await?;
         Ok(())
     }
 
+
     // 给 proxy 调用，通知 tunnel 某个 session 关闭
-    pub async fn on_proxy_conn_close(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("Tunnel.onProxyConnClose session id:{}", session_id);
+    pub async fn on_proxy_conn_close_from_proxy(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("Tunnel.on_proxy_conn_close_from_proxy session id:{}", session_id);
         let msg = pb::Message {
             r#type: pb::MessageType::ProxySessionClose as i32,
             session_id: session_id.to_string(),
@@ -550,7 +569,7 @@ impl Tunnel {
         Ok(())
     }
 
-    pub async fn on_proxy_udp_close(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn on_proxy_udp_close_from_proxy(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.proxy_udps.remove(session_id);
         Ok(())
     }
@@ -613,7 +632,7 @@ impl Tunnel {
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
-        debug!("onping");
+        // debug!("onping");
         let mut guard = self.ws_writer.lock().await;
         let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
 
@@ -678,7 +697,8 @@ impl Tunnel {
                     
                     if let Err(e) = self.write_ping(&now).await {
                         error!("failed to send ping: {:?}", e);
-                        return;
+                        // let _ = self.cancel_ws_reader.send(true);
+                        // return;
                     }
 
                     debug!("keepalive send ping");

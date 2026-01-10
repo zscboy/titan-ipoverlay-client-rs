@@ -6,6 +6,7 @@ use anyhow::Result;
 use log::{debug, error, info};
 use crate::tunnel::tunnel::Tunnel;
 use tokio::time::{timeout, Duration};
+use tokio::sync::Notify;
 
 
 const TCP_WRITE_TIMEOUT: u64 = 3;
@@ -19,12 +20,17 @@ pub struct TcpProxy {
     pub id: String,
 
     reader: Mutex<Option<ReadHalf<TcpStream>>>,
-    raw: Mutex<Option<Arc<Mutex<TcpStream>>>>,
+    // raw: Mutex<Option<Arc<Mutex<TcpStream>>>>,
 
     write_queue: mpsc::UnboundedSender<WriteMsg>,
 
     /// writer ready 只会 send 一次
     writer_ready_tx: Mutex<Option<oneshot::Sender<Arc<Mutex<WriteHalf<TcpStream>>>>>>,
+
+    /// 用于优雅关闭 reader
+    reader_notify: Notify,
+
+    is_close: Mutex<bool>,
 }
 
 impl TcpProxy {
@@ -36,9 +42,11 @@ impl TcpProxy {
         let proxy = Arc::new(Self {
             id: id.clone(),
             reader: Mutex::new(None),
-            raw: Mutex::new(None),
+            // raw: Mutex::new(None),
             write_queue: write_tx,
             writer_ready_tx: Mutex::new(Some(writer_ready_tx)),
+            reader_notify: Notify::new(),
+            is_close: Mutex::new(false),
         });
 
         let proxy_id = id.clone();
@@ -50,11 +58,11 @@ impl TcpProxy {
     }
     
      pub async fn set_connection(&self, stream: TcpStream) -> Result<()> {
-        let std_stream: std::net::TcpStream = stream.into_std()?;
-        let std_stream_clone = std_stream.try_clone()?;
+        // let std_stream: std::net::TcpStream = stream.into_std()?;
+        // let std_stream_clone = std_stream.try_clone()?;
 
-        let raw = TcpStream::from_std(std_stream_clone)?;
-        let stream = TcpStream::from_std(std_stream)?;
+        // let raw = TcpStream::from_std(std_stream_clone)?;
+        // let stream: TcpStream = TcpStream::from_std(std_stream)?;
 
         let (reader, writer) = tokio::io::split(stream);
 
@@ -68,10 +76,10 @@ impl TcpProxy {
         }
 
         // 设置 raw
-        {
-            let mut guard = self.raw.lock().await;
-            *guard = Some(Arc::new(Mutex::new(raw)));
-        }
+        // {
+        //     let mut guard = self.raw.lock().await;
+        //     *guard = Some(Arc::new(Mutex::new(raw)));
+        // }
 
         // 通知 writer ready（只会成功一次）
         let writer_arc = Arc::new(Mutex::new(writer));
@@ -103,7 +111,7 @@ impl TcpProxy {
 
         while let Some(msg) = write_rx.recv().await {
             match msg {
-                WriteMsg::Data(data) => {
+                WriteMsg::Data(data) => {;
                     let mut guard = writer.lock().await;
                     let result = timeout(
                         Duration::from_secs(TCP_WRITE_TIMEOUT),
@@ -114,65 +122,86 @@ impl TcpProxy {
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            error!("tcp proxy {} write err: {}", id, e);
+                            error!("write_queue_processor {} write err: {}", id, e);
                             break;
                         }
                         Err(_) => {
-                            error!("tcp proxy {} write timeout", id);
+                            error!("write_queue_processor {} write timeout", id);
                             break;
                         }
                     }
                 }
 
                 WriteMsg::HalfClose => {
-                    info!("tcp proxy {} half_close (shutdown write)", id);
-                    let mut guard = writer.lock().await;
+                    info!("write_queue_processor {} half_close (shutdown write)", id);
+                    let mut guard: tokio::sync::MutexGuard<'_, WriteHalf<TcpStream>> = writer.lock().await;
                     let _ = guard.shutdown().await;
                     break;
                 }
             }
         }
 
-        debug!("tcp proxy {} write processor exit", id);
+        debug!("tcp proxy {} write_queue_processor exit", id);
     }
 
 
     pub async fn proxy_conn(self: Arc<Self>, tunnel: Arc<Tunnel>) {
-        let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 4096];
 
-        loop {
-            let n = {
+    loop {
+        // let closed = *self.is_close.lock().await;
+        // if closed { 
+        //     error!("proxy {} already shutdown", &self.id);
+        //     return; 
+        // }
+
+        let n = tokio::select! {
+            _ = self.reader_notify.notified() => {
+                info!("tcp proxy {} reader notified to shutdown", self.id);
+                return;
+            }
+
+            res = async {
                 let mut guard = self.reader.lock().await;
-                let reader = match guard.as_mut() {
-                    Some(r) => r,
-                    None => {
-                        error!("proxy_conn called but reader not ready {}", self.id);
-                        return;
-                    }
-                };
-
-                match reader.read(&mut buf).await {
+                let reader = guard.as_mut().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "reader not ready")
+                })?;
+                reader.read(&mut buf).await
+            } => {
+                match res {
                     Ok(0) => {
-                        debug!("tcp proxy eof {}", self.id);
+                        debug!("tcp proxy {} eof", self.id);
+                        if let Err(e) = tunnel.on_proxy_conn_half_close_from_proxy(&self.id).await
+                        {
+                            error!("on_proxy_conn_half_close_from_proxy err {}", e);
+                            return;
+                        }
                         return;
                     }
                     Ok(n) => n,
                     Err(e) => {
-                        error!("tcp proxy read err {} {}", self.id, e);
+                        error!("tcp proxy {} read err {}", self.id, e);
+                        if let Err(e) = tunnel.on_proxy_conn_close_from_proxy(&self.id).await
+                        {
+                            error!("on_proxy_conn_close_from_proxy err {}", e);
+                            return;
+                        }
                         return;
                     }
                 }
-            };
-
-            if let Err(e) = tunnel
-                .on_proxy_session_data_from_proxy(&self.id, &buf[..n])
-                .await
-            {
-                error!("send ws data err {}", e);
-                return;
             }
+        };
+
+        if let Err(e) = tunnel
+            .on_proxy_session_data_from_proxy(&self.id, &buf[..n])
+            .await
+        {
+            error!("send ws data err {}", e);
+            return;
         }
-   }
+    }
+}
+
 
     pub async fn half_close(&self) -> Result<()> {
         self.write_queue
@@ -190,9 +219,14 @@ impl TcpProxy {
     }
 
     async fn shutdown(&self) {
-        if let Some(raw) = self.raw.lock().await.as_ref() {
-            let mut g = raw.lock().await;
-            let _ = g.shutdown().await;
+        debug!("shutdown");
+        let mut closed = self.is_close.lock().await;
+        *closed = true;
+
+        self.reader_notify.notify_waiters();
+
+        if let Err(e) = self.half_close().await {
+            error!("shutdown {} half_close failed: {}", self.id, e);
         }
     }
 

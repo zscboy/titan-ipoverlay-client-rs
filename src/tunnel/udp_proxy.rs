@@ -103,7 +103,7 @@ impl UdpProxy {
             }
         }
 
-        if let Err(e) = tunnel.on_proxy_udp_close(&self.id).await {
+        if let Err(e) = tunnel.on_proxy_udp_close_from_proxy(&self.id).await {
             error!("on_proxy_udp_close error: {}", e);
         }
 
