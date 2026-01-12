@@ -27,6 +27,7 @@ pub struct TcpProxy {
     /// writer ready 只会 send 一次
     writer_ready_tx: Mutex<Option<oneshot::Sender<Arc<Mutex<WriteHalf<TcpStream>>>>>>,
 
+    is_half_closed_by_self: Mutex<bool>
     // 用于优雅关闭 reader
     // reader_notify: Notify,
 
@@ -45,6 +46,7 @@ impl TcpProxy {
             raw: Mutex::new(None),
             write_queue: write_tx,
             writer_ready_tx: Mutex::new(Some(writer_ready_tx)),
+            is_half_closed_by_self: Mutex::new(false),
             // reader_notify: Notify::new(),
             // is_close: Mutex::new(false),
         });
@@ -160,12 +162,19 @@ impl TcpProxy {
             } => {
                 match res {
                     Ok(0) => {
-                        debug!("tcp proxy {} eof", self.id);
-                        // TODO: 自己调用shutdown也会跑这里
-                        if let Err(e) = tunnel.on_proxy_conn_half_close_from_proxy(&self.id).await
-                        {
-                            error!("on_proxy_conn_half_close_from_proxy err {}", e);
-                            return;
+                        let self_closed = *self.is_half_closed_by_self.lock().await;
+                        if !self_closed {
+                            debug!("tcp proxy {} remote half-close", self.id);
+                            if let Err(e) = tunnel.on_proxy_conn_half_close_from_proxy(&self.id).await {
+                                error!("on_proxy_conn_half_close_from_proxy err {}", e);
+                            }
+                        } else {
+                            debug!("tcp proxy {} read 0 due to self shutdown, ignore", self.id);
+                            if let Err(e) = tunnel.on_proxy_conn_close_from_proxy(&self.id).await
+                            {
+                                error!("on_proxy_conn_close_from_proxy err {}", e);
+                                return;
+                            }
                         }
                         return;
                     }
@@ -195,6 +204,10 @@ impl TcpProxy {
 
 
     pub async fn half_close(&self) -> Result<()> {
+        {
+            let mut guard = self.is_half_closed_by_self.lock().await;
+            *guard = true;
+        }
         self.write_queue
             .send(WriteMsg::HalfClose)
             .map_err(|e| anyhow::anyhow!("half_close send failed: {}", e))?;
