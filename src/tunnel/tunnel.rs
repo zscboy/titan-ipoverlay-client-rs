@@ -18,7 +18,7 @@ use crate::tunnel::{bootstrap::BootstrapMgr, tcp_proxy::TcpProxy, udp_proxy::Udp
 use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-const KEEPALIVE_INTERVAL: u64 = 20;
+const KEEPALIVE_INTERVAL: u64 = 5;
 const MAX_PONG_MISS: i32 = 15;
 const WS_WRITE_TIMEOUT: u64 = 3;
 
@@ -237,11 +237,18 @@ impl Tunnel {
                     ws_msg = ws_reader.next() => {
                         match ws_msg {
                             Some(Ok(WsMessage::Binary(bin))) => {
+                                {
+                                    *self.waitpone.write().await = 0;
+                                }
                                 if let Err(e) = self.on_tunnel_msg(&bin).await {
                                     error!("on_tunnel_msg err: {:?}", e);
                                 }
                             }
                             Some(Ok(WsMessage::Ping(p))) => {
+                                debug!("on server ping");
+                                {
+                                    *self.waitpone.write().await = 0;
+                                }
                                 let _ = self.write_pong(&p).await;
                             }
                             Some(Ok(WsMessage::Pong(_))) => {
@@ -633,7 +640,7 @@ impl Tunnel {
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
-        // debug!("onping");
+        debug!("onping");
         let mut guard = self.ws_writer.lock().await;
         let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
 
@@ -678,16 +685,20 @@ impl Tunnel {
                         return;
                     }
 
-                    let mut w = self.waitpone.write().await;
-                    if *w > MAX_PONG_MISS {
+                    let is_timeout = {
+                        let mut w = self.waitpone.write().await;
+                        if *w > MAX_PONG_MISS {
+                            true
+                        } else {
+                            *w += 1;
+                            false
+                        }
+                    }; // ← 写锁在这里释放
+
+                    if is_timeout {
                         info!("keepalive timeout, close websocket");
-                        // if let Some(ws) = self.ws_writer.lock().await.as_mut() {
-                        //     let _ = ws.close().await;
-                        // }
                         let _ = self.cancel_ws_reader.send(true);
                         continue;
-                    } else {
-                        *w += 1;
                     }
 
                     let now = SystemTime::now()

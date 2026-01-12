@@ -6,7 +6,6 @@ use anyhow::Result;
 use log::{debug, error, info};
 use crate::tunnel::tunnel::Tunnel;
 use tokio::time::{timeout, Duration};
-use tokio::sync::Notify;
 
 
 const TCP_WRITE_TIMEOUT: u64 = 3;
@@ -113,7 +112,7 @@ impl TcpProxy {
 
         while let Some(msg) = write_rx.recv().await {
             match msg {
-                WriteMsg::Data(data) => {;
+                WriteMsg::Data(data) => {
                     let mut guard = writer.lock().await;
                     let result = timeout(
                         Duration::from_secs(TCP_WRITE_TIMEOUT),
