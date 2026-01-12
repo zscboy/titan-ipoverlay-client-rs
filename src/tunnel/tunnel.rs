@@ -6,7 +6,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use reqwest::Client;
-use log::{info, debug, error};
+use log::{debug, error, info};
 use prost::Message;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use tokio_tungstenite::{WebSocketStream, MaybeTlsStream};
@@ -17,6 +17,7 @@ use std::error::Error;
 use crate::tunnel::{bootstrap::BootstrapMgr, tcp_proxy::TcpProxy, udp_proxy::UdpProxy};
 use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio::task::JoinHandle;
 
 const KEEPALIVE_INTERVAL: u64 = 5;
 const MAX_PONG_MISS: i32 = 15;
@@ -56,7 +57,8 @@ pub struct Tunnel {
     is_destroy: Arc<RwLock<bool>>,
     udp_timeout: u64,
     tcp_timeout: u64,
-    cancel_keepalive: watch::Sender<bool>,
+    cancel_keepalive: Mutex<watch::Sender<bool>>,
+    keepalive_task: Mutex<Option<JoinHandle<()>>>,
     cancel_ws_reader: watch::Sender<bool>,
     version: String,
     http_client: Client,
@@ -80,7 +82,8 @@ impl Tunnel {
             is_destroy: Arc::new(RwLock::new(false)),
             udp_timeout: opts.udp_timeout,
             tcp_timeout: opts.tcp_timeout,
-            cancel_keepalive: tx,
+            cancel_keepalive: Mutex::new(tx),
+            keepalive_task: Mutex::new(None),
             cancel_ws_reader: tx_reader,
             version: opts.version,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
@@ -115,12 +118,39 @@ impl Tunnel {
 
         *self.waitpone.write().await = 0;
 
-        let me = Arc::clone(self);
-        tokio::spawn(async move { me.keepalive_loop().await });
+        self.start_keepalive().await;
 
         info!("Tunnel.Connect, new tun {}", url);
         Ok(())
     }
+
+    pub async fn start_keepalive(self: &Arc<Self>) {
+        // ① 停掉旧的 keepalive
+        if let Some(old) = self.keepalive_task.lock().await.take() {
+            info!("stopping old keepalive");
+            let _ = self.cancel_keepalive.lock().await.send(true);
+            let _ = old.await; // ⭐ 等待真正退出
+        }
+
+        // ② 创建新的 cancel channel
+        let (tx, _rx) = watch::channel(false);
+        *self.cancel_keepalive.lock().await = tx;
+
+        // ③ 重置 pong 计数
+        *self.waitpone.write().await = 0;
+
+        // ④ 启动新的 keepalive
+        let me = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            me.keepalive_loop().await;
+        });
+
+        *self.keepalive_task.lock().await = Some(handle);
+
+        info!("keepalive started");
+    }
+
+
 
     async fn get_pop(&self) -> Result<Pop> {
         let access_points = if !self.direct_url.is_empty() {
@@ -206,13 +236,13 @@ impl Tunnel {
     pub async fn destroy(self: &Arc<Self>) -> Result<()> {
         *self.is_destroy.write().await = true;
 
-        // if let Some(mut ws) = self.ws_writer.lock().await.take() {
-        //     let _ = ws.close().await;
-        // }
-
         let _ = self.cancel_ws_reader.send(true);
 
-        // self.clear_proxys().await;
+        if let Some(task) = self.keepalive_task.lock().await.take() {
+            let _ = self.cancel_keepalive.lock().await.send(true);
+            let _ = task.await;
+        }
+
         Ok(())
     }
 
@@ -276,8 +306,6 @@ impl Tunnel {
         }
 
         self.on_close().await;
-        
-        let _ = self.cancel_keepalive.send(true);
 
         debug!("tunnel {} serve exit", self.uuid);
         Ok(())
@@ -640,7 +668,6 @@ impl Tunnel {
     }
 
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
-        debug!("onping");
         let mut guard = self.ws_writer.lock().await;
         let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
 
@@ -674,7 +701,7 @@ impl Tunnel {
 
     async fn keepalive_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL));
-        let mut rx = self.cancel_keepalive.subscribe(); // 订阅 channel
+          let mut rx = self.cancel_keepalive.lock().await.subscribe();
 
         loop {
             tokio::select! {
@@ -691,6 +718,9 @@ impl Tunnel {
                             true
                         } else {
                             *w += 1;
+                            if *w > MAX_PONG_MISS / 3 {
+                                debug!("keepalive,delay {}", *w)
+                            }
                             false
                         }
                     }; // ← 写锁在这里释放
@@ -709,17 +739,14 @@ impl Tunnel {
                     
                     if let Err(e) = self.write_ping(&now).await {
                         error!("failed to send ping: {:?}", e);
-                        // let _ = self.cancel_ws_reader.send(true);
-                        // return;
                     }
 
-                    debug!("keepalive send ping");
                 }
 
                 _ = rx.changed() => {
                     // 收到取消通知
                     if *rx.borrow() {
-                        info!("keepalive canceled via watch channel");
+                        info!("keepalive canceled");
                         return;
                     }
                 }
