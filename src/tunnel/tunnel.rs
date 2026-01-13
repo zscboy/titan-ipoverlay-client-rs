@@ -275,7 +275,6 @@ impl Tunnel {
                                 }
                             }
                             Some(Ok(WsMessage::Ping(p))) => {
-                                debug!("on server ping");
                                 {
                                     *self.waitpone.write().await = 0;
                                 }
@@ -312,7 +311,6 @@ impl Tunnel {
     }
 
     async fn on_tunnel_msg(self: &Arc<Self>, message: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_tunnel_msg");
         let msg: pb::Message = pb::Message::decode(message)?;
         match pb::MessageType::try_from(msg.r#type).unwrap() {
             pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
@@ -326,7 +324,7 @@ impl Tunnel {
     }
 
     async fn on_proxy_session_create(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_proxy_session_create");
+        info!("on_proxy_session_create session_id:{}", msg.session_id);
         self.clone().create_proxy_session(msg).await?;
         Ok(())
     }
@@ -335,7 +333,6 @@ impl Tunnel {
         self: Arc<Self>,
         msg: pb::Message,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("create_proxy_session");
 
         // 1️⃣ 如果 session 已存在，直接回复
         if self.proxy_sessions.contains_key(&msg.session_id) {
@@ -479,7 +476,6 @@ impl Tunnel {
     }
 
     async fn on_proxy_session_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_proxy_session_data_from_tunnel");
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
             proxy.write(&msg.payload).await?;
         } else { return Err(format!("session {} not found", msg.session_id).into()); }
@@ -487,7 +483,7 @@ impl Tunnel {
     }
 
     async fn on_proxy_session_half_close_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_proxy_session_half_close_from_tunnel");
+        info!("on_proxy_session_half_close_from_tunnel session_id:{}", msg.session_id);
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
              proxy.half_close().await?;
         } else { return Err(format!("session {} not found", msg.session_id).into()); }
@@ -495,24 +491,21 @@ impl Tunnel {
     }
 
     async fn on_proxy_session_close_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_proxy_session_close_from_tunnel");
+        info!("on_proxy_session_close_from_tunnel session_id:{}", msg.session_id);
         if let Some((_, proxy)) = self.proxy_sessions.remove(&msg.session_id) {
             proxy.close_by_server().await;
         } else {
-            return Err(format!("session {} not found", msg.session_id).into());
+            info!("session {} not found when close from tunnel", msg.session_id);
         }
         Ok(())
     }
 
     async fn on_proxy_udp_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("on_proxy_udp_data_from_tunnel");
         let udp_data = pb::UdpData::decode(msg.payload.as_ref())?;
         let id = msg.session_id.clone();
 
         if let Some(proxy) = self.proxy_udps.get(&id) {
-            debug!("on_proxy_udp_data_from_tunnel, to be write date to {}", id);
             proxy.write(&udp_data.data).await?;
-            debug!("on_proxy_udp_data_from_tunnel, write date to {} complete", id);
             return Ok(());
         }
 
@@ -545,7 +538,7 @@ impl Tunnel {
         proxy_udp.write(&udp_data.data).await?;
         self.proxy_udps.insert(id.clone(), proxy_udp.clone());
 
-        debug!("Tunnel.on_proxy_udp_data_from_tunnel new udp:{}, id:{}, total udp:{}", udp_data.addr, proxy_udp.id.clone(), self.proxy_udps.len());
+        info!("Tunnel.on_proxy_udp_data_from_tunnel new udp:{}, id:{}, total udp:{}", udp_data.addr, proxy_udp.id.clone(), self.proxy_udps.len());
 
         let tunnel_clone = Arc::clone(self);
         tokio::spawn(async move {
@@ -559,7 +552,6 @@ impl Tunnel {
 
       // 给 proxy 调用，发送 TCP session 数据回 tunnel
     pub async fn on_proxy_session_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("Tunnel.on_proxy_session_data_from_proxy session id:{} len:{}", session_id, data.len());
         let msg = pb::Message {
             r#type: pb::MessageType::ProxySessionData as i32,
             session_id: session_id.to_string(),
@@ -576,7 +568,7 @@ impl Tunnel {
     }
 
     pub async fn on_proxy_conn_half_close_from_proxy(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("Tunnel.on_proxy_conn_half_close_from_proxy session id:{}", session_id);
+        info!("Tunnel.on_proxy_conn_half_close_from_proxy session id:{}", session_id);
         let msg = pb::Message {
             r#type: pb::MessageType::ProxySessionHalfClose as i32,
             session_id: session_id.to_string(),
@@ -591,7 +583,7 @@ impl Tunnel {
 
     // 给 proxy 调用，通知 tunnel 某个 session 关闭
     pub async fn on_proxy_conn_close_from_proxy(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("Tunnel.on_proxy_conn_close_from_proxy session id:{}", session_id);
+        info!("Tunnel.on_proxy_conn_close_from_proxy session id:{}", session_id);
         let msg = pb::Message {
             r#type: pb::MessageType::ProxySessionClose as i32,
             session_id: session_id.to_string(),
@@ -601,11 +593,14 @@ impl Tunnel {
         msg.encode(&mut buf)?;
         self.write(&buf).await?;
 
-        self.proxy_sessions.remove(session_id);
+        if self.proxy_sessions.remove(session_id).is_none() {
+             info!("session {} not found when close from proxy", session_id);
+        }
         Ok(())
     }
 
     pub async fn on_proxy_udp_close_from_proxy(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        info!("Tunnel.on_proxy_udp_close_from_proxy session id:{}", session_id);
         self.proxy_udps.remove(session_id);
         Ok(())
     }
@@ -613,7 +608,6 @@ impl Tunnel {
 
     // 给 proxy 调用，发送 UDP 数据回 tunnel
     pub async fn on_proxy_udp_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
-        debug!("Tunnel.onProxyUdpDataFromProxy session id:{}", session_id);
         let msg = pb::Message {
             r#type: pb::MessageType::ProxyUdpData as i32,
             session_id: session_id.to_string(),

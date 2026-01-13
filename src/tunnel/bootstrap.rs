@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::RwLock, time::sleep};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use log::{error, info};
 use reqwest::Client;
 
 const UPDATE_INTERVAL: u64 = 12 * 60 * 60; // 12 hours in seconds

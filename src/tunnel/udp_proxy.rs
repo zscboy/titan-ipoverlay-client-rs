@@ -3,7 +3,7 @@ use std::time::{Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use anyhow::Result;
-use log::{debug, error};
+use log::{debug,info, error};
 use tokio::sync::{Notify};
 use tokio::time::{timeout, Duration};
 
@@ -68,7 +68,7 @@ impl UdpProxy {
     pub async fn check_idle_timeout(&self) -> bool {
         let t = self.last_active.lock().await;
         if t.elapsed().as_secs() >= self.timeout_secs {
-            debug!("udp proxy {} idle timeout", self.id);
+            info!("udp proxy {} idle timeout", self.id);
             return true;
         }
         false
@@ -107,7 +107,7 @@ impl UdpProxy {
             error!("on_proxy_udp_close error: {}", e);
         }
 
-        debug!("udp proxy {} close", self.id);
+        info!("udp proxy {} close", self.id);
 
         Ok(())
     }
