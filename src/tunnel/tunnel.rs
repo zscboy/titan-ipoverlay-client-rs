@@ -94,6 +94,7 @@ impl Tunnel {
     }
 
     pub async fn connect(self: &Arc<Self>) -> Result<()> {
+        let _ = self.cancel_ws_reader.send(false);
         let pop = self.get_pop().await?;
         let url = format!(
             "{}?id={}&os={}&version={}",
@@ -260,7 +261,7 @@ impl Tunnel {
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => {
-                        debug!("serve received shutdown");
+                        info!("serve received shutdown");
                         break;
                     }
 
@@ -288,7 +289,7 @@ impl Tunnel {
                                 break;
                             }
                             None => {
-                                debug!("ws reader closed");
+                                info!("ws reader closed");
                                 break;
                             }
                             _ => {}
@@ -304,9 +305,11 @@ impl Tunnel {
             let _ = ws.close().await;
         }
 
+        let _ = self.cancel_ws_reader.send(true);
+
         self.on_close().await;
 
-        debug!("tunnel {} serve exit", self.uuid);
+        info!("tunnel {} serve exit", self.uuid);
         Ok(())
     }
 
@@ -695,7 +698,8 @@ impl Tunnel {
 
     async fn keepalive_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL));
-          let mut rx = self.cancel_keepalive.lock().await.subscribe();
+        let mut rx = self.cancel_keepalive.lock().await.subscribe();
+        let mut rx_ws = self.cancel_ws_reader.subscribe();
 
         loop {
             tokio::select! {
@@ -741,6 +745,13 @@ impl Tunnel {
                     // 收到取消通知
                     if *rx.borrow() {
                         info!("keepalive canceled");
+                        return;
+                    }
+                }
+
+                _ = rx_ws.changed() => {
+                    if *rx_ws.borrow() {
+                        info!("keepalive loop exit due to ws closed");
                         return;
                     }
                 }
