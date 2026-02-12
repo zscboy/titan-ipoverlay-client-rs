@@ -27,3 +27,10 @@ prost-build = "0.13"
 
 [features]
 default = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
