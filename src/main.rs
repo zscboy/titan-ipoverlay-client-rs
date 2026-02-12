@@ -19,8 +19,9 @@ async fn main() {
         .arg(Arg::new("direct-url").long("direct-url").default_value("").help("--direct-url=http://localhost:41005/node/pop"))
         .arg(Arg::new("uuid").long("uuid").required(true).help("--uuid ..."))
         .arg(Arg::new("udp-timeout").long("udp-timeout").default_value("30").help("--udp-timeout 30"))
-        .arg(Arg::new("tcp-timeout").long("tcp-timeout").default_value("3").help("--tcp-timeout 3"))
+        .arg(Arg::new("tcp-timeout").long("tcp-timeout").default_value("10").help("--tcp-timeout 10"))
         .arg(Arg::new("debug").long("debug").action(clap::ArgAction::SetTrue).help("--debug"))
+        .arg(Arg::new("vendor").long("vendor").default_value("unknown").help("--vendor unknown"))
         .get_matches();
 
     if matches.get_flag("debug") {
@@ -33,7 +34,8 @@ async fn main() {
     let direct_url = matches.get_one::<String>("direct-url").unwrap().clone();
     let uuid = matches.get_one::<String>("uuid").unwrap().clone();
     let udp_timeout: u64 = matches.get_one::<String>("udp-timeout").unwrap().parse().unwrap_or(60);
-    let tcp_timeout: u64 = matches.get_one::<String>("tcp-timeout").unwrap().parse().unwrap_or(3);
+    let tcp_timeout: u64 = matches.get_one::<String>("tcp-timeout").unwrap().parse().unwrap_or(10);
+    let vendor = matches.get_one::<String>("vendor").unwrap().clone();
 
     let mut opts = TunnelOptions {
         uuid: uuid.clone(),
@@ -42,6 +44,7 @@ async fn main() {
         bootstrap_mgr: None,
         direct_url: direct_url.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        vendor,
     };
 
     if direct_url.is_empty() {

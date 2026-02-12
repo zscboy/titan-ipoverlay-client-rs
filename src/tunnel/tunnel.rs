@@ -41,6 +41,7 @@ pub struct TunnelOptions {
     pub bootstrap_mgr: Option<Arc<BootstrapMgr>>,
     pub direct_url: String,
     pub version: String,
+    pub vendor: String,
 }
 
 pub struct Tunnel {
@@ -59,6 +60,7 @@ pub struct Tunnel {
     cancel_keepalive: watch::Sender<bool>,
     cancel_ws_reader: watch::Sender<bool>,
     version: String,
+    vendor: String,
     http_client: Client,
 }
 
@@ -83,6 +85,7 @@ impl Tunnel {
             cancel_keepalive: tx,
             cancel_ws_reader: tx_reader,
             version: opts.version,
+            vendor: opts.vendor,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
         });
 
@@ -93,8 +96,8 @@ impl Tunnel {
     pub async fn connect(self: &Arc<Self>) -> Result<()> {
         let pop = self.get_pop().await?;
         let url = format!(
-            "{}?id={}&os={}&version={}",
-            pop.url, self.uuid, std::env::consts::OS, self.version
+            "{}?id={}&os={}&version={}&vendor={}",
+            pop.url, self.uuid, std::env::consts::OS, self.version, self.vendor
         );
 
         let ws_url = Url::parse(&url)?;
@@ -135,7 +138,7 @@ impl Tunnel {
 
         //  debug!("access_points {}", string::fr);
         for ap in access_points {
-            let server_url = format!("{}?nodeid={}", ap, self.uuid);
+            let server_url = format!("{}?nodeid={}&vendor={}&version={}", ap, self.uuid, self.vendor, self.version);
             match self.http_get(&server_url).await {
                 Ok(bytes) => {
                     if let Ok(pop) = serde_json::from_slice::<Pop>(&bytes) {
