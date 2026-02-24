@@ -568,7 +568,7 @@ impl Tunnel {
                     
                     if let Err(e) = self.write_ping(&now).await {
                         error!("failed to send ping: {:?}", e);
-                        return;
+                        // return;
                     }
 
                     debug!("keepalive send ping");
