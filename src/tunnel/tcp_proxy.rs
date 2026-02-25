@@ -3,7 +3,7 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 use anyhow::Result;
-use log::{debug, error};
+use log::{error, info};
 use crate::tunnel::tunnel::Tunnel;
 use tokio::time::{timeout, Duration};
 
@@ -44,7 +44,7 @@ impl TcpProxy {
                 let mut reader = self.reader.lock().await;
                 match reader.read(&mut buf).await {
                     Ok(0) => {
-                        debug!("tcp proxy read eof id={}", self.id);
+                        info!("tcp proxy read eof id={}", self.id);
                         break;
                     }
                     Ok(n) => n,
