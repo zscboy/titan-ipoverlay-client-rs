@@ -113,6 +113,10 @@ async fn tun_serve(tun: Arc<Tunnel>) {
             return;
         }
 
+        // reconnet in 3s
+        info!("Tunnel serve error, reconnect in 3s");
+        sleep(Duration::from_secs(3)).await;
+
         // 连接失败则不断重试
         loop {
             let tun_clone = Arc::clone(&tun);

@@ -14,7 +14,7 @@ pub struct TcpProxy {
     pub id: String,
     reader: Mutex<ReadHalf<TcpStream>>,
     writer: Mutex<WriteHalf<TcpStream>>,
-    raw: Arc<Mutex<TcpStream>>, // ✅ 保留原始连接，供 shutdown 使用
+    raw: Arc<Mutex<TcpStream>>, // 保留原始连接，供 shutdown 使用
 }
 
 impl TcpProxy {

@@ -534,7 +534,9 @@ impl Tunnel {
     async fn keepalive_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL));
         let mut rx = self.cancel_keepalive.subscribe(); // 订阅 channel
-
+        
+        let mut tick_counter: u64 = 0;
+        
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -567,7 +569,10 @@ impl Tunnel {
                         // return;
                     }
 
-                    debug!("keepalive send ping");
+                    tick_counter += 1;
+                    if tick_counter % 10 == 0 {
+                        info!("keepalive send ping, wait: {}", *w);
+                    }
                 }
 
                 _ = rx.changed() => {
