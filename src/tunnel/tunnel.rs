@@ -1,22 +1,22 @@
+use crate::tunnel::{bootstrap::BootstrapMgr, tcp_proxy::TcpProxy, udp_proxy::UdpProxy};
+use anyhow::Result;
+use dashmap::DashMap;
+use futures_util::{stream::SplitSink, stream::SplitStream, SinkExt, StreamExt};
+use log::{debug, error, info};
+use prost::Message;
+use reqwest::Client;
+use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use anyhow::Result;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
-use reqwest::Client;
-use log::{info, debug, error};
-use prost::Message;
-use futures_util::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
-use tokio_tungstenite::{WebSocketStream, MaybeTlsStream};
-use tokio::net::TcpStream;
-use url::Url;
-use dashmap::DashMap;
-use std::error::Error;
-use crate::tunnel::{bootstrap::BootstrapMgr, tcp_proxy::TcpProxy, udp_proxy::UdpProxy};
-use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use url::Url;
 
 const KEEPALIVE_INTERVAL: u64 = 5;
 const MAX_PONG_MISS: i32 = 12;
@@ -94,10 +94,17 @@ impl Tunnel {
     }
 
     pub async fn connect(self: &Arc<Self>) -> Result<()> {
+        let _ = self.cancel_keepalive.send(false);
+        let _ = self.cancel_ws_reader.send(false);
+
         let pop = self.get_pop().await?;
         let url = format!(
             "{}?id={}&os={}&version={}&vendor={}",
-            pop.url, self.uuid, std::env::consts::OS, self.version, self.vendor
+            pop.url,
+            self.uuid,
+            std::env::consts::OS,
+            self.version,
+            self.vendor
         );
 
         let ws_url = Url::parse(&url)?;
@@ -138,7 +145,10 @@ impl Tunnel {
 
         //  debug!("access_points {}", string::fr);
         for ap in access_points {
-            let server_url = format!("{}?nodeid={}&vendor={}&version={}", ap, self.uuid, self.vendor, self.version);
+            let server_url = format!(
+                "{}?nodeid={}&vendor={}&version={}",
+                ap, self.uuid, self.vendor, self.version
+            );
             match self.http_get(&server_url).await {
                 Ok(bytes) => {
                     if let Ok(pop) = serde_json::from_slice::<Pop>(&bytes) {
@@ -171,7 +181,10 @@ impl Tunnel {
             let bytes = match self.http_get(&bootstrap_url).await {
                 Ok(b) => b,
                 Err(e) => {
-                    error!("Tunnel.get_access_point http_get error: {}, url: {}", e, bootstrap_url);
+                    error!(
+                        "Tunnel.get_access_point http_get error: {}, url: {}",
+                        e, bootstrap_url
+                    );
                     continue;
                 }
             };
@@ -213,7 +226,9 @@ impl Tunnel {
         //     let _ = ws.close().await;
         // }
 
-        let _ = self.cancel_ws_reader.send(true);
+        if let Err(e) = self.cancel_ws_reader.send(true) {
+            error!("destroy, send cancel_ws_reader signal failed: {:?}", e);
+        }
 
         // self.clear_proxys().await;
         Ok(())
@@ -272,18 +287,25 @@ impl Tunnel {
         }
 
         self.on_close().await;
-        
-        let _ = self.cancel_keepalive.send(true);
+
+        if let Err(e) = self.cancel_keepalive.send(true) {
+            error!("serve exit, send cancel_keepalive signal failed: {:?}", e);
+        }
 
         info!("tunnel {} serve exit", self.uuid);
         Ok(())
     }
 
-    async fn on_tunnel_msg(self: &Arc<Self>, message: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn on_tunnel_msg(
+        self: &Arc<Self>,
+        message: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let msg: pb::Message = pb::Message::decode(message)?;
         match pb::MessageType::try_from(msg.r#type).unwrap() {
             pb::MessageType::ProxySessionCreate => self.on_proxy_session_create(msg).await?,
-            pb::MessageType::ProxySessionData => self.on_proxy_session_data_from_tunnel(msg).await?,
+            pb::MessageType::ProxySessionData => {
+                self.on_proxy_session_data_from_tunnel(msg).await?
+            }
             pb::MessageType::ProxySessionClose => self.on_proxy_session_close(msg).await?,
             pb::MessageType::ProxyUdpData => self.on_proxy_udp_data_from_tunnel(msg).await?,
             _ => error!("onTunnelMsg unsupported message type {:?}", msg.r#type),
@@ -291,19 +313,25 @@ impl Tunnel {
         Ok(())
     }
 
-    async fn on_proxy_session_create(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn on_proxy_session_create(
+        self: &Arc<Self>,
+        msg: pb::Message,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("on_proxy_session_create session id {}", msg.session_id);
         // self.clone().create_proxy_session(msg).await?;
         let tunnel_clone = self.clone();
         tokio::spawn(async move {
-             if let Err(e) = tunnel_clone.create_proxy_session(msg.clone()).await {
+            if let Err(e) = tunnel_clone.create_proxy_session(msg.clone()).await {
                 error!("create_proxy_session: {}", e);
             }
         });
         Ok(())
     }
 
-    async fn create_proxy_session(self: Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn create_proxy_session(
+        self: Arc<Self>,
+        msg: pb::Message,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // info!("create_proxy_session {}", msg.session_id);
         // 如果 session 已存在，直接回复
         if self.proxy_sessions.contains_key(&msg.session_id) {
@@ -311,51 +339,96 @@ impl Tunnel {
         }
 
         let dest_addr: pb::DestAddr = pb::DestAddr::decode(msg.payload.as_ref())?;
-        let conn: TcpStream = match timeout(Duration::from_secs(self.tcp_timeout), TcpStream::connect(dest_addr.addr.clone())).await {
+        let conn: TcpStream = match timeout(
+            Duration::from_secs(self.tcp_timeout),
+            TcpStream::connect(dest_addr.addr.clone()),
+        )
+        .await
+        {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
-            Err(e) => return self.create_proxy_session_reply(&msg.session_id, Some(Box::new(e))).await,
+            Ok(Err(e)) => {
+                return self
+                    .create_proxy_session_reply(&msg.session_id, Some(Box::new(e)))
+                    .await
+            }
+            Err(e) => {
+                return self
+                    .create_proxy_session_reply(&msg.session_id, Some(Box::new(e)))
+                    .await
+            }
         };
-        info!("new tcp {}, id {}, total {}", dest_addr.addr.clone(), msg.session_id.clone(), self.proxy_sessions.len());
+        info!(
+            "new tcp {}, id {}, total {}",
+            dest_addr.addr.clone(),
+            msg.session_id.clone(),
+            self.proxy_sessions.len()
+        );
         // let proxy_session = Arc::new(TcpProxy { id: msg.session_id.clone(), conn: Arc::new(Mutex::new(conn)) });
-        let proxy_session = TcpProxy::new( msg.session_id.clone(), conn).await?;
+        let proxy_session = TcpProxy::new(msg.session_id.clone(), conn).await?;
         let proxy_session = Arc::new(proxy_session);
-        self.proxy_sessions.insert(msg.session_id.clone(), proxy_session.clone());
+        self.proxy_sessions
+            .insert(msg.session_id.clone(), proxy_session.clone());
 
-        self.clone().create_proxy_session_reply(&msg.session_id, None).await?;
+        self.clone()
+            .create_proxy_session_reply(&msg.session_id, None)
+            .await?;
 
         proxy_session.proxy_conn(self.clone()).await;
 
         Ok(())
     }
 
-    async fn create_proxy_session_reply(self: Arc<Self>, session_id: &str, err: Option<Box<dyn Error + Send + Sync>>) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let reply = pb::CreateSessionReply { success: err.is_none(), err_msg: err.as_ref().map_or("".to_string(), |e| e.to_string()) };
+    async fn create_proxy_session_reply(
+        self: Arc<Self>,
+        session_id: &str,
+        err: Option<Box<dyn Error + Send + Sync>>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let reply = pb::CreateSessionReply {
+            success: err.is_none(),
+            err_msg: err.as_ref().map_or("".to_string(), |e| e.to_string()),
+        };
         let mut buf = Vec::new();
         reply.encode(&mut buf)?;
-        let msg = pb::Message { r#type: pb::MessageType::ProxySessionCreate as i32, session_id: session_id.to_string(), payload: buf };
+        let msg = pb::Message {
+            r#type: pb::MessageType::ProxySessionCreate as i32,
+            session_id: session_id.to_string(),
+            payload: buf,
+        };
         let mut data = Vec::new();
         msg.encode(&mut data)?;
         self.write(&data).await?;
         Ok(())
     }
 
-    async fn on_proxy_session_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn on_proxy_session_data_from_tunnel(
+        self: &Arc<Self>,
+        msg: pb::Message,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
             proxy.write(&msg.payload).await?;
-        } else { return Err(format!("session {} not found", msg.session_id).into()); }
+        } else {
+            return Err(format!("session {} not found", msg.session_id).into());
+        }
         Ok(())
     }
 
-    async fn on_proxy_session_close(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn on_proxy_session_close(
+        self: &Arc<Self>,
+        msg: pb::Message,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("on_proxy_session_close");
         if let Some(proxy) = self.proxy_sessions.get(&msg.session_id) {
-             proxy.close_by_server().await;
-        } else { return Err(format!("session {} not found", msg.session_id).into()); }
+            proxy.close_by_server().await;
+        } else {
+            return Err(format!("session {} not found", msg.session_id).into());
+        }
         Ok(())
     }
 
-    async fn on_proxy_udp_data_from_tunnel(self: &Arc<Self>, msg: pb::Message) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn on_proxy_udp_data_from_tunnel(
+        self: &Arc<Self>,
+        msg: pb::Message,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let udp_data = pb::UdpData::decode(msg.payload.as_ref())?;
         let id = msg.session_id.clone();
 
@@ -368,30 +441,26 @@ impl Tunnel {
 
         let raddr: std::net::SocketAddr = match udp_data.addr.parse() {
             Ok(a) => a,
-            Err(_) => {
-                match tokio::net::lookup_host(&udp_data.addr).await {
-                    Ok(mut addrs) => {
-                        match addrs.next() {
-                            Some(a) => a,
-                            None => {
-                                error!("DNS lookup returned no result for {}", udp_data.addr);
-                                return Err(anyhow::anyhow!("invalid udp addr").into());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to resolve domain {}: {}", udp_data.addr, e);
+            Err(_) => match tokio::net::lookup_host(&udp_data.addr).await {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(a) => a,
+                    None => {
+                        error!("DNS lookup returned no result for {}", udp_data.addr);
                         return Err(anyhow::anyhow!("invalid udp addr").into());
                     }
+                },
+                Err(e) => {
+                    error!("Failed to resolve domain {}: {}", udp_data.addr, e);
+                    return Err(anyhow::anyhow!("invalid udp addr").into());
                 }
-            }
+            },
         };
 
         let conn: UdpSocket = UdpSocket::bind("0.0.0.0:0").await?;
         conn.connect(raddr).await?;
 
         // UdpProxy { id: id.clone(), socket: Arc::new(conn), timeout_secs: self.udp_timeout }
-        let proxy_udp = Arc::new(UdpProxy::new(id.clone(), Arc::new(conn), self.udp_timeout ));
+        let proxy_udp = Arc::new(UdpProxy::new(id.clone(), Arc::new(conn), self.udp_timeout));
         proxy_udp.write(&udp_data.data).await?;
         self.proxy_udps.insert(id.clone(), proxy_udp.clone());
 
@@ -407,8 +476,12 @@ impl Tunnel {
         Ok(())
     }
 
-      // 给 proxy 调用，发送 TCP session 数据回 tunnel
-    pub async fn on_proxy_session_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // 给 proxy 调用，发送 TCP session 数据回 tunnel
+    pub async fn on_proxy_session_data_from_proxy(
+        self: &Arc<Self>,
+        session_id: &str,
+        data: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let msg = pb::Message {
             r#type: pb::MessageType::ProxySessionData as i32,
             session_id: session_id.to_string(),
@@ -421,7 +494,10 @@ impl Tunnel {
     }
 
     // 给 proxy 调用，通知 tunnel 某个 session 关闭
-    pub async fn on_proxy_conn_close(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn on_proxy_conn_close(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("Tunnel.onProxyConnClose session id:{}", session_id);
         let msg = pb::Message {
             r#type: pb::MessageType::ProxySessionClose as i32,
@@ -436,14 +512,20 @@ impl Tunnel {
         Ok(())
     }
 
-    pub async fn on_proxy_udp_close(self: &Arc<Self>, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn on_proxy_udp_close(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.proxy_udps.remove(session_id);
         Ok(())
     }
 
-
     // 给 proxy 调用，发送 UDP 数据回 tunnel
-    pub async fn on_proxy_udp_data_from_proxy(self: &Arc<Self>, session_id: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn on_proxy_udp_data_from_proxy(
+        self: &Arc<Self>,
+        session_id: &str,
+        data: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // debug!("Tunnel.onProxyUdpDataFromProxy session id:{}", session_id);
         let msg = pb::Message {
             r#type: pb::MessageType::ProxyUdpData as i32,
@@ -458,11 +540,15 @@ impl Tunnel {
 
     async fn write(&self, data: &[u8]) -> Result<()> {
         let mut guard = self.ws_writer.lock().await;
-        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
+        let ws = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
 
-        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
-            ws.send(WsMessage::Binary(data.to_vec()))
-        ).await;
+        let result = timeout(
+            Duration::from_secs(WS_WRITE_TIMEOUT),
+            ws.send(WsMessage::Binary(data.to_vec())),
+        )
+        .await;
 
         match result {
             Ok(Ok(())) => Ok(()),
@@ -479,11 +565,15 @@ impl Tunnel {
 
     async fn write_ping(&self, data: &[u8]) -> Result<()> {
         let mut guard = self.ws_writer.lock().await;
-        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
+        let ws = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
 
-        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
-             ws.send(WsMessage::Ping(data.to_vec()))
-        ).await;
+        let result = timeout(
+            Duration::from_secs(WS_WRITE_TIMEOUT),
+            ws.send(WsMessage::Ping(data.to_vec())),
+        )
+        .await;
 
         match result {
             Ok(Ok(())) => Ok(()),
@@ -501,11 +591,15 @@ impl Tunnel {
     async fn write_pong(&self, data: &[u8]) -> Result<()> {
         debug!("onping");
         let mut guard = self.ws_writer.lock().await;
-        let ws = guard.as_mut().ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
+        let ws = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ws_writer is none"))?;
 
-        let result = timeout(Duration::from_secs(WS_WRITE_TIMEOUT),
-             ws.send(WsMessage::Pong(data.to_vec()))
-        ).await;
+        let result = timeout(
+            Duration::from_secs(WS_WRITE_TIMEOUT),
+            ws.send(WsMessage::Pong(data.to_vec())),
+        )
+        .await;
 
         match result {
             Ok(Ok(())) => Ok(()),
@@ -520,23 +614,39 @@ impl Tunnel {
         }
     }
 
-    async fn on_close(&self) { self.clear_proxys().await; }
+    async fn on_close(&self) {
+        self.clear_proxys().await;
+    }
 
     async fn clear_proxys(&self) {
-        for k in self.proxy_sessions.iter().map(|e| e.key().clone()).collect::<Vec<_>>() {
-            if let Some((_, proxy)) = self.proxy_sessions.remove(&k) { proxy.destroy().await; }
+        for k in self
+            .proxy_sessions
+            .iter()
+            .map(|e| e.key().clone())
+            .collect::<Vec<_>>()
+        {
+            if let Some((_, proxy)) = self.proxy_sessions.remove(&k) {
+                proxy.destroy().await;
+            }
         }
-        for k in self.proxy_udps.iter().map(|e| e.key().clone()).collect::<Vec<_>>() {
-            if let Some((_, proxy)) = self.proxy_udps.remove(&k) { proxy.destroy().await; }
+        for k in self
+            .proxy_udps
+            .iter()
+            .map(|e| e.key().clone())
+            .collect::<Vec<_>>()
+        {
+            if let Some((_, proxy)) = self.proxy_udps.remove(&k) {
+                proxy.destroy().await;
+            }
         }
     }
 
     async fn keepalive_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL));
         let mut rx = self.cancel_keepalive.subscribe(); // 订阅 channel
-        
+
         let mut tick_counter: u64 = 0;
-        
+
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -546,16 +656,22 @@ impl Tunnel {
                         return;
                     }
 
-                    let mut w = self.waitpone.write().await;
-                    if *w > MAX_PONG_MISS {
+                    let current_wait = {
+                        let mut w = self.waitpone.write().await;
+                        if *w > MAX_PONG_MISS {
+                            *w
+                        } else {
+                            *w += 1;
+                            *w
+                        }
+                    };
+
+                    if current_wait > MAX_PONG_MISS {
                         info!("keepalive timeout, close websocket");
-                        // if let Some(ws) = self.ws_writer.lock().await.as_mut() {
-                        //     let _ = ws.close().await;
-                        // }
-                        let _ = self.cancel_ws_reader.send(true);
+                        if let Err(e) = self.cancel_ws_reader.send(true) {
+                            error!("keepalive timeout, send cancel_ws_reader signal failed: {:?}", e);
+                        }
                         continue;
-                    } else {
-                        *w += 1;
                     }
 
                     let now = SystemTime::now()
@@ -563,7 +679,7 @@ impl Tunnel {
                         .unwrap()
                         .as_secs()
                         .to_le_bytes();
-                    
+
                     if let Err(e) = self.write_ping(&now).await {
                         error!("failed to send ping: {:?}", e);
                         // return;
@@ -571,7 +687,7 @@ impl Tunnel {
 
                     tick_counter += 1;
                     if tick_counter % 10 == 0 {
-                        info!("keepalive send ping, wait: {}", *w);
+                        info!("keepalive send ping, wait: {}", current_wait);
                     }
                 }
 
@@ -590,7 +706,8 @@ impl Tunnel {
         let tunnel = Arc::clone(this);
 
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(tunnel.udp_timeout/2));
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(tunnel.udp_timeout / 2));
             loop {
                 ticker.tick().await;
 
@@ -610,11 +727,8 @@ impl Tunnel {
                     if let Some(proxy) = tunnel.proxy_udps.get(&id) {
                         let _ = proxy.destroy().await;
                     }
-
-                    
                 }
             }
         });
     }
-
 }
