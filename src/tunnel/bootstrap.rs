@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::RwLock, time::sleep};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use log::{error, info};
 use reqwest::Client;
 
 const UPDATE_INTERVAL: u64 = 12 * 60 * 60; // 12 hours in seconds
@@ -41,7 +41,15 @@ impl BootstrapMgr {
             Err(e) => return Err(e.into()),
         };
 
-        let cfg: Config = serde_json::from_slice(&bytes)?;
+        let cfg: Config = match serde_json::from_slice(&bytes) {
+           Ok(cfg) => cfg,
+           Err(e) => {
+              error!("BootstrapMgr parse config failed:{}, remove bootstrap: {}", e, bootstrap_path.display());
+              let _ = tokio_fs::remove_file(&bootstrap_path).await;
+              return Err(e.into());
+           }
+        };
+
         let mgr = BootstrapMgr {
             dir,
             bootstraps: Arc::new(RwLock::new(cfg.bootstraps.clone())),
