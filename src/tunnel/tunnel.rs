@@ -6,6 +6,7 @@ use log::{debug, error, info};
 use prost::Message;
 use reqwest::Client;
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -62,6 +63,7 @@ pub struct Tunnel {
     version: String,
     vendor: String,
     http_client: Client,
+    upload_test_running: Arc<AtomicBool>,
 }
 
 impl Tunnel {
@@ -87,6 +89,7 @@ impl Tunnel {
             version: opts.version,
             vendor: opts.vendor,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
+            upload_test_running: Arc::new(AtomicBool::new(false)),
         });
 
         Tunnel::start_udp_idle_watchdog(&t).await;
@@ -308,6 +311,7 @@ impl Tunnel {
             }
             pb::MessageType::ProxySessionClose => self.on_proxy_session_close(msg).await?,
             pb::MessageType::ProxyUdpData => self.on_proxy_udp_data_from_tunnel(msg).await?,
+            pb::MessageType::UploadTestReq => self.on_upload_test_req(msg).await?,
             _ => error!("onTunnelMsg unsupported message type {:?}", msg.r#type),
         }
         Ok(())
@@ -473,6 +477,85 @@ impl Tunnel {
             }
         });
 
+        Ok(())
+    }
+
+    async fn on_upload_test_req(
+        self: &Arc<Self>,
+        msg: pb::Message,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let req = pb::UploadTestRequest::decode(msg.payload.as_ref())?;
+        match pb::upload_test_request::Action::try_from(req.action).unwrap() {
+            pb::upload_test_request::Action::Start => {
+                if self.upload_test_running.swap(true, Ordering::SeqCst) {
+                    info!("upload test already running, ignore new START");
+                    return Ok(());
+                }
+                let me = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = me.run_upload_test(req.session_id, req.duration).await {
+                        error!("run_upload_test err: {:?}", e);
+                    }
+                    me.upload_test_running.store(false, Ordering::SeqCst);
+                });
+            }
+            pb::upload_test_request::Action::Stop => {
+                info!("received upload test STOP");
+                self.upload_test_running.store(false, Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_upload_test(
+        &self,
+        session_id: String,
+        duration_secs: i32,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        info!("starting upload test, duration: {}s", duration_secs);
+        let start_time = std::time::Instant::now();
+        let duration = Duration::from_secs(duration_secs as u64);
+
+        let payload = vec![0u8; 32 * 1024]; // 32KB buffer
+
+        while start_time.elapsed() < duration {
+            if self.is_destroyed().await || !self.upload_test_running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let msg = pb::Message {
+                r#type: pb::MessageType::UploadTestData as i32,
+                session_id: session_id.clone(),
+                payload: payload.clone(),
+            };
+            let mut buf = Vec::new();
+            msg.encode(&mut buf)?;
+
+            if let Err(e) = self.write(&buf).await {
+                error!("upload test write failed: {:?}", e);
+                break;
+            }
+        }
+
+        // Send STOP
+        let stop_req = pb::UploadTestRequest {
+            action: pb::upload_test_request::Action::Stop as i32,
+            duration: duration_secs,
+            session_id: session_id.clone(),
+        };
+        let mut stop_payload = Vec::new();
+        stop_req.encode(&mut stop_payload)?;
+
+        let stop_msg = pb::Message {
+            r#type: pb::MessageType::UploadTestReq as i32,
+            session_id: session_id,
+            payload: stop_payload,
+        };
+        let mut stop_buf = Vec::new();
+        stop_msg.encode(&mut stop_buf)?;
+
+        let _ = self.write(&stop_buf).await;
+        info!("upload test finished");
         Ok(())
     }
 
