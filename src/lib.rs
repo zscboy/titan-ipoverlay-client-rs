@@ -70,6 +70,7 @@ pub extern "system" fn Java_com_titan_IPService_startClient(
                 direct_url: direct_url.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 vendor: "android".to_string(),
+                is_lib: true,
             };
 
             // Initialize bootstrap if needed

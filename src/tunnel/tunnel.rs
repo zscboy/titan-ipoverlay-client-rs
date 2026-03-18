@@ -43,6 +43,7 @@ pub struct TunnelOptions {
     pub direct_url: String,
     pub version: String,
     pub vendor: String,
+    pub is_lib: bool,
 }
 
 pub struct Tunnel {
@@ -62,6 +63,7 @@ pub struct Tunnel {
     cancel_ws_reader: watch::Sender<bool>,
     version: String,
     vendor: String,
+    is_lib: bool,
     http_client: Client,
     upload_test_running: Arc<AtomicBool>,
 }
@@ -88,6 +90,7 @@ impl Tunnel {
             cancel_ws_reader: tx_reader,
             version: opts.version,
             vendor: opts.vendor,
+            is_lib: opts.is_lib,
             http_client: Client::builder().timeout(Duration::from_secs(5)).build()?,
             upload_test_running: Arc::new(AtomicBool::new(false)),
         });
@@ -102,12 +105,13 @@ impl Tunnel {
 
         let pop = self.get_pop().await?;
         let url = format!(
-            "{}?id={}&os={}&version={}&vendor={}",
+            "{}?id={}&os={}&version={}&vendor={}&is_lib={}",
             pop.url,
             self.uuid,
             std::env::consts::OS,
             self.version,
-            self.vendor
+            self.vendor,
+            if self.is_lib { 1 } else { 0 }
         );
 
         let ws_url = Url::parse(&url)?;
@@ -149,8 +153,8 @@ impl Tunnel {
         //  debug!("access_points {}", string::fr);
         for ap in access_points {
             let server_url = format!(
-                "{}?nodeid={}&vendor={}&version={}",
-                ap, self.uuid, self.vendor, self.version
+                "{}?nodeid={}&vendor={}&version={}&is_lib={}",
+                ap, self.uuid, self.vendor, self.version, if self.is_lib { 1 } else { 0 }
             );
             match self.http_get(&server_url).await {
                 Ok(bytes) => {

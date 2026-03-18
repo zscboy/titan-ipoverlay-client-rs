@@ -45,6 +45,7 @@ async fn main() {
         direct_url: direct_url.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         vendor,
+        is_lib: false,
     };
 
     if direct_url.is_empty() {
