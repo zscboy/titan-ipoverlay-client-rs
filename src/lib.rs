@@ -17,8 +17,10 @@ mod platform;
 mod tunnel;
 use tunnel::{Tunnel, TunnelOptions, BootstrapMgr};
 
-// Simple global runtime for demonstration
+// Simple global runtime and tunnel state for singleton management
 static mut RUNTIME: Option<Runtime> = None;
+static mut CURRENT_TUNNEL: Option<Arc<Tunnel>> = None;
+static mut STARTING: bool = false;
 
 #[no_mangle]
 pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
@@ -33,11 +35,26 @@ pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
     let direct_url: String = env.get_string(&direct_url).unwrap().into();
 
     unsafe {
+        if STARTING {
+            info!("Android: Tunnel is already starting, skipping startClient");
+            return;
+        }
+
         if RUNTIME.is_none() {
             RUNTIME = Some(Runtime::new().unwrap());
         }
         
         let rt = RUNTIME.as_ref().unwrap();
+
+        if let Some(ref tun) = CURRENT_TUNNEL {
+            if !rt.block_on(async { tun.is_destroyed().await }) {
+                info!("Android: Tunnel is already running, skipping startClient");
+                return;
+            }
+        }
+        
+        STARTING = true;
+        
         rt.spawn(async move {
             let opts = TunnelOptions {
                 uuid: uuid.clone(),
@@ -57,10 +74,21 @@ pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
                 }
             }
 
-            if let Ok(tun) = Tunnel::new(final_opts).await {
-                if let Ok(_) = tun.connect().await {
-                    info!("Android: Tunnel connect success");
-                    tun_serve(tun).await;
+            match Tunnel::new(final_opts).await {
+                Ok(tun) => {
+                    unsafe {
+                        CURRENT_TUNNEL = Some(Arc::clone(&tun));
+                        STARTING = false;
+                    }
+                    
+                    if let Ok(_) = tun.connect().await {
+                        info!("Android: Tunnel connect success");
+                        tun_serve(tun).await;
+                    }
+                }
+                Err(e) => {
+                    error!("Android: Tunnel init failed: {:?}", e);
+                    unsafe { STARTING = false; }
                 }
             }
         });
