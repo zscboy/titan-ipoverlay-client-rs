@@ -40,6 +40,13 @@ pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
         }
 
         if RUNTIME.is_none() {
+            #[cfg(target_os = "android")]
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_max_level(log::LevelFilter::Info)
+                    .with_tag("titan_rust"),
+            );
+
             RUNTIME = Some(Runtime::new().unwrap());
         }
         
