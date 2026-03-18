@@ -27,77 +27,84 @@ cargo install cargo-ndk
 
 ---
 
-## 2. Project Modifications
+## 2. JNI Interfaces (src/lib.rs)
 
-### Update `Cargo.toml`
-To build a shared library, you must add a `[lib]` section and optionally the `jni` dependency.
+The library provides a thread-safe singleton manager for the tunnel. You should only call `startClient` once per lifecycle.
 
-1. Add `crate-type`:
-```toml
-[lib]
-name = "titan_ip_overlay"  # This will produce libtitan_ip_overlay.so
-crate-type = ["cdylib", "rlib"]
+### Exposed JNI Methods
+Your Java class `com.example.titan.TunnelManager` should declare these methods:
 
-[dependencies]
-# ... other dependencies ...
-jni = "0.21" # Optional: only if you need to call rust from Java/Kotlin
-```
-
-### Create `src/lib.rs` (if not already present)
-If your project only has `src/main.rs`, you need to expose your functionality in `src/lib.rs`.
-
-Example of a JNI entry point to start the client:
-```rust
-use jni::JNIEnv;
-use jni::objects::{JClass, JString};
-use jni::sys::jstring;
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
-    mut env: JNIEnv,
-    _class: JClass,
-    uuid: JString,
-) {
-    let uuid: String = env.get_string(&uuid).expect("Couldn't get java string!").into();
-    
-    // Call your internal startup logic here
-    // Note: Since main.rs uses #[tokio::main], you'll need to spawn a runtime or use a static one.
+```java
+public class TunnelManager {
+    static {
+        System.loadLibrary("titan_ip_overlay");
+    }
+    // Start the client (non-blocking, spawns a background tokio task)
+    public native void startClient(String appDir, String uuid);
+    // Check if the tunnel is currently active
+    public native boolean isAlive();
+    // Stop the running tunnel client
+    public native void stopClient();
 }
 ```
+
+### Key Implementation Details
+- **Singleton Pattern**: The Rust side uses `CURRENT_TUNNEL` and `STARTING` flags to prevent duplicate connections.
+- **Graceful Shutdown**: `stopClient` triggers `tun.destroy()` which closes all proxy sessions and the WebSocket connection.
 
 ---
 
 ## 3. Building
 
-### Case A: Build Android Shared Library (.so)
-If you want to use this in an Android App (via JNI), use the `android-lib` feature:
+### Output for Android App (JNI .so)
+To build for common architectures, run these commands:
 
 ```bash
-cargo ndk -t arm64-v8a build --release --lib --features android-lib
-```
+# ARM 64-bit (Physical phones)
+cargo ndk -t aarch64-linux-android build --release --features android-lib
 
-### Case B: Build Android Standalone Binary (bin)
-If you want to run this in Termux or as a CLI tool on Android, omit the feature:
+# ARM 32-bit (Older phones)
+cargo ndk -t armv7-linux-androideabi build --release --features android-lib
 
-```bash
-cargo ndk -t arm64-v8a build --release --bin titan-ipoverlay-client
+# x86 (Emulator 32-bit)
+cargo ndk -t i686-linux-android build --release --features android-lib
+
+# x86_64 (Emulator 64-bit)
+cargo ndk -t x86_64-linux-android build --release --features android-lib
 ```
 
 ### Output Location
-- **.so**: `target/aarch64-linux-android/release/libtitan_ip_overlay.so`
-- **bin**: `target/aarch64-linux-android/release/titan-ipoverlay-client`
+The compiled `.so` files will be located in:
+`target/<target-triple>/release/libtitan_ip_overlay.so`
 
 ---
 
-## 4. Integration in Android Studio
-1. Copy the `.so` files into your Android project's `app/src/main/jniLibs/` directory:
-   - `jniLibs/arm64-v8a/libtitan_ip_overlay.so`
-   - `jniLibs/armeabi-v7a/libtitan_ip_overlay.so`
-2. Load the library in Java/Kotlin:
-   ```kotlin
-   System.loadLibrary("titan_ip_overlay")
-   ```
-3. Declare the `external` function:
-   ```kotlin
-   external fun startClient(uuid: String)
-   ```
+## 4. Android Studio Integration
+
+### jniLibs Directory Structure
+Copy the generated `.so` files into your Android project under `app/src/main/jniLibs/`:
+
+```text
+app/src/main/jniLibs/
+├── arm64-v8a/libtitan_ip_overlay.so
+├── armeabi-v7a/libtitan_ip_overlay.so
+├── x86/libtitan_ip_overlay.so
+└── x86_64/libtitan_ip_overlay.so
+```
+
+### Proguard Rules
+If you enable obfuscation (minifyEnabled true), add these rules to `proguard-rules.pro`:
+```proguard
+-keep class com.example.titan.** { *; }
+-keepclassmembers class com.example.titan.** {
+    native <methods>;
+}
+```
+
+---
+
+## 5. Reference Project
+A complete working example is available in the `android-example/` directory. It includes:
+- Correct Gradle configuration for JNI.
+- Basic UI for connecting/stopping the tunnel.
+- Correct directory structure for resources and manifests.

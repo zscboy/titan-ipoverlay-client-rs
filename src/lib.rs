@@ -11,7 +11,7 @@ use log::{info, error, LevelFilter};
 use env_logger;
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
-use jni::sys::{jint, jstring};
+use jni::sys::{jint, jstring, jboolean};
 
 mod platform;
 mod tunnel;
@@ -28,11 +28,10 @@ pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
     _class: JClass,
     app_dir: JString,
     uuid: JString,
-    direct_url: JString,
 ) {
     let app_dir: String = env.get_string(&app_dir).unwrap().into();
     let uuid: String = env.get_string(&uuid).unwrap().into();
-    let direct_url: String = env.get_string(&direct_url).unwrap().into();
+    let direct_url: String = "".to_string();
 
     unsafe {
         if STARTING {
@@ -92,6 +91,37 @@ pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
                 }
             }
         });
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_example_titan_TunnelManager_isAlive(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    unsafe {
+        if let Some(ref tun) = CURRENT_TUNNEL {
+            if let Some(ref rt) = RUNTIME {
+                return (!rt.block_on(async { tun.is_destroyed().await })) as jboolean;
+            }
+        }
+        false as jboolean
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_example_titan_TunnelManager_stopClient(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    unsafe {
+        if let Some(ref tun) = CURRENT_TUNNEL {
+            if let Some(ref rt) = RUNTIME {
+                info!("Android: Stopping tunnel client");
+                let _ = rt.block_on(async { tun.destroy().await });
+            }
+        }
+        CURRENT_TUNNEL = None;
     }
 }
 
