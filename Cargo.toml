@@ -3,7 +3,12 @@ name = "titan-ipoverlay-client"
 version = "0.1.2"
 edition = "2021"
 
+[lib]
+name = "titan_ip_overlay"
+crate-type = ["staticlib", "cdylib"]
+
 [dependencies]
+jni = { version = "0.21", optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls"] }
 tungstenite = { version = "0.21", default-features = false, features = ["__rustls-tls"] }
@@ -27,6 +32,7 @@ prost-build = "0.13"
 
 [features]
 default = []
+android-lib = ["jni"]
 
 [profile.release]
 opt-level = "z"
