@@ -31,26 +31,8 @@ cargo install cargo-ndk
 
 The library provides a thread-safe singleton manager for the tunnel. You should only call `startClient` once per lifecycle.
 
-### Exposed JNI Methods
-Your Java class `com.example.titan.TunnelManager` should declare these methods:
-
-```java
-public class TunnelManager {
-    static {
-        System.loadLibrary("titan_ip_overlay");
-    }
-    // Start the client (non-blocking, spawns a background tokio task)
-    public native void startClient(String appDir, String uuid);
-    // Check if the tunnel is currently active
-    public native boolean isAlive();
-    // Stop the running tunnel client
-    public native void stopClient();
-}
-```
-
-### Key Implementation Details
-- **Singleton Pattern**: The Rust side uses `CURRENT_TUNNEL` and `STARTING` flags to prevent duplicate connections.
-- **Graceful Shutdown**: `stopClient` triggers `tun.destroy()` which closes all proxy sessions and the WebSocket connection.
+For detailed Java implementation and the bridge class, see:
+[doc/jni_interface_reference.md](jni_interface_reference.md)
 
 ---
 
@@ -81,6 +63,18 @@ The compiled `.so` files will be located in:
 
 ## 4. Android Studio Integration
 
+### Permissions (AndroidManifest.xml)
+Add these permissions to your `AndroidManifest.xml` to allow network access:
+
+```xml
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+<application
+    android:usesCleartextTraffic="true"
+    ... >
+```
+
 ### jniLibs Directory Structure
 Copy the generated `.so` files into your Android project under `app/src/main/jniLibs/`:
 
@@ -95,8 +89,8 @@ app/src/main/jniLibs/
 ### Proguard Rules
 If you enable obfuscation (minifyEnabled true), add these rules to `proguard-rules.pro`:
 ```proguard
--keep class com.example.titan.** { *; }
--keepclassmembers class com.example.titan.** {
+-keep class com.titan.** { *; }
+-keepclassmembers class com.titan.** {
     native <methods>;
 }
 ```
@@ -104,7 +98,8 @@ If you enable obfuscation (minifyEnabled true), add these rules to `proguard-rul
 ---
 
 ## 5. Reference Project
-A complete working example is available in the `android-example/` directory. It includes:
+A complete working example is available in the `helloword/` directory. It includes:
 - Correct Gradle configuration for JNI.
-- Basic UI for connecting/stopping the tunnel.
+- UI buttons for connecting/stopping the tunnel.
+- Real-time status polling for the tunnel.
 - Correct directory structure for resources and manifests.

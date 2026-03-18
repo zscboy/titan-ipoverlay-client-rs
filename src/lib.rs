@@ -23,7 +23,7 @@ static mut CURRENT_TUNNEL: Option<Arc<Tunnel>> = None;
 static mut STARTING: bool = false;
 
 #[no_mangle]
-pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
+pub extern "system" fn Java_com_titan_IPService_startClient(
     mut env: JNIEnv,
     _class: JClass,
     app_dir: JString,
@@ -102,7 +102,7 @@ pub extern "system" fn Java_com_example_titan_TunnelManager_startClient(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_example_titan_TunnelManager_isAlive(
+pub extern "system" fn Java_com_titan_IPService_isAlive(
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
@@ -117,7 +117,7 @@ pub extern "system" fn Java_com_example_titan_TunnelManager_isAlive(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_example_titan_TunnelManager_stopClient(
+pub extern "system" fn Java_com_titan_IPService_stopClient(
     _env: JNIEnv,
     _class: JClass,
 ) {
