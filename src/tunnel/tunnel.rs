@@ -41,6 +41,7 @@ pub struct TunnelOptions {
     pub tcp_timeout: u64,
     pub bootstrap_mgr: Option<Arc<BootstrapMgr>>,
     pub direct_url: String,
+    pub dns_url: String,
     pub version: String,
     pub vendor: String,
     pub is_lib: bool,
@@ -53,6 +54,7 @@ pub struct Tunnel {
     // write_lock: Mutex<()>,
     bootstrap_mgr: Option<Arc<BootstrapMgr>>,
     direct_url: String,
+    dns_url: String,
     waitpone: Arc<RwLock<i32>>,
     proxy_sessions: DashMap<String, Arc<TcpProxy>>,
     proxy_udps: DashMap<String, Arc<UdpProxy>>,
@@ -80,6 +82,7 @@ impl Tunnel {
             // write_lock: Mutex::new(()),
             bootstrap_mgr: opts.bootstrap_mgr,
             direct_url: opts.direct_url,
+            dns_url: opts.dns_url,
             waitpone: Arc::new(RwLock::new(0)),
             proxy_sessions: DashMap::new(),
             proxy_udps: DashMap::new(),
@@ -154,7 +157,11 @@ impl Tunnel {
         for ap in access_points {
             let server_url = format!(
                 "{}?nodeid={}&vendor={}&version={}&is_lib={}",
-                ap, self.uuid, self.vendor, self.version, if self.is_lib { 1 } else { 0 }
+                ap,
+                self.uuid,
+                self.vendor,
+                self.version,
+                if self.is_lib { 1 } else { 0 }
             );
             match self.http_get(&server_url).await {
                 Ok(bytes) => {
@@ -347,9 +354,10 @@ impl Tunnel {
         }
 
         let dest_addr: pb::DestAddr = pb::DestAddr::decode(msg.payload.as_ref())?;
+        let addr = self.resolve_domain(&dest_addr.addr).await?;
         let conn: TcpStream = match timeout(
             Duration::from_secs(self.tcp_timeout),
-            TcpStream::connect(dest_addr.addr.clone()),
+            TcpStream::connect(addr.clone()),
         )
         .await
         {
@@ -367,7 +375,7 @@ impl Tunnel {
         };
         info!(
             "new tcp {}, id {}, total {}",
-            dest_addr.addr.clone(),
+            addr,
             msg.session_id.clone(),
             self.proxy_sessions.len()
         );
@@ -561,6 +569,75 @@ impl Tunnel {
         let _ = self.write(&stop_buf).await;
         info!("upload test finished");
         Ok(())
+    }
+
+    async fn resolve_domain(&self, addr: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        // Just extract the host from addr which might be "example.com:8080"
+        let parts: Vec<&str> = addr.split(':').collect();
+        let host = parts[0];
+        let port = if parts.len() > 1 {
+            format!(":{}", parts[1])
+        } else {
+            "".to_string()
+        };
+
+        // If host is an IP, return as is
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(addr.to_string());
+        }
+
+        if !self.dns_url.is_empty() {
+            // DoH resolution (Google/Alibaba JSON API)
+            // Example: https://223.5.5.5/resolve?name=example.com&type=1
+            let url = format!("{}?name={}&type=1", self.dns_url, host);
+            match self.http_get(&url).await {
+                Ok(bytes) => {
+                    #[derive(serde::Deserialize)]
+                    struct DnsAnswer {
+                        // r#type: i32,
+                        data: String,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct DnsResponse {
+                        #[serde(rename = "Answer")]
+                        answer: Option<Vec<DnsAnswer>>,
+                    }
+
+                    if let Ok(resp) = serde_json::from_slice::<DnsResponse>(&bytes) {
+                        if let Some(answers) = resp.answer {
+                            for ans in answers {
+                                if ans.data.parse::<std::net::IpAddr>().is_ok() {
+                                    debug!("DoH resolved {} to {}", host, ans.data);
+                                    return Ok(format!("{}{}", ans.data, port));
+                                }
+                            }
+                        }
+                    } else {
+                        error!("Failed to parse DoH JSON response from {}", self.dns_url);
+                        if let Ok(body) = String::from_utf8(bytes) {
+                            debug!("Raw DoH response: {}", body);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("DoH resolution failed: {}, url: {}", e, url);
+                }
+            }
+        }
+
+        // Fallback to system DNS
+        match tokio::net::lookup_host(addr).await {
+            Ok(mut addrs) => {
+                if let Some(resolved_addr) = addrs.next() {
+                    return Ok(resolved_addr.to_string());
+                }
+            }
+            Err(e) => {
+                error!("System DNS resolution failed for {}: {}", addr, e);
+            }
+        }
+
+        Err(anyhow::anyhow!("failed to resolve domain: {}", addr).into())
     }
 
     // 给 proxy 调用，发送 TCP session 数据回 tunnel

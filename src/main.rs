@@ -22,6 +22,7 @@ async fn main() {
         .arg(Arg::new("tcp-timeout").long("tcp-timeout").default_value("10").help("--tcp-timeout 10"))
         .arg(Arg::new("debug").long("debug").action(clap::ArgAction::SetTrue).help("--debug"))
         .arg(Arg::new("vendor").long("vendor").default_value("unknown").help("--vendor unknown"))
+        .arg(Arg::new("dns-url").long("dns-url").default_value("").help("--dns-url=https://223.5.5.5/resolve"))
         .get_matches();
 
     if matches.get_flag("debug") {
@@ -36,6 +37,7 @@ async fn main() {
     let udp_timeout: u64 = matches.get_one::<String>("udp-timeout").unwrap().parse().unwrap_or(60);
     let tcp_timeout: u64 = matches.get_one::<String>("tcp-timeout").unwrap().parse().unwrap_or(10);
     let vendor = matches.get_one::<String>("vendor").unwrap().clone();
+    let dns_url = matches.get_one::<String>("dns-url").unwrap().clone();
 
     let mut opts = TunnelOptions {
         uuid: uuid.clone(),
@@ -43,6 +45,7 @@ async fn main() {
         tcp_timeout,
         bootstrap_mgr: None,
         direct_url: direct_url.clone(),
+        dns_url,
         version: env!("CARGO_PKG_VERSION").to_string(),
         vendor,
         is_lib: false,
